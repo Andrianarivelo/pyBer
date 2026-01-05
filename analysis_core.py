@@ -11,7 +11,7 @@ import numpy as np
 import h5py
 
 from scipy.signal import butter, sosfiltfilt, resample_poly
-from PySide6 import QtCore  # needed for worker signals
+from PySide6 import QtCore  # for QRunnable signals
 
 try:
     from sklearn.linear_model import Lasso
@@ -39,7 +39,7 @@ OUTPUT_MODES = [
 @dataclass
 class ProcessingParams:
     # Artifact
-    artifact_mode: str = "Global MAD (dx)"  # "Adaptive MAD (windowed)"
+    artifact_mode: str = "Global MAD (dx)"  # or "Adaptive MAD (windowed)"
     mad_k: float = 8.0
     adaptive_window_s: float = 5.0
     artifact_pad_s: float = 0.25
@@ -53,7 +53,7 @@ class ProcessingParams:
 
     # Baseline via pybaselines
     baseline_method: str = "airpls"  # asls | arpls | airpls
-    baseline_lambda: float = 1e8
+    baseline_lambda: float = 1e9    # "gamma/lambda" (UI shows as x e y)
     baseline_diff_order: int = 2
     baseline_max_iter: int = 50
     baseline_tol: float = 1e-3
@@ -88,6 +88,7 @@ class LoadedTrial:
     sampling_rate: float
     trigger_time: Optional[np.ndarray] = None
     trigger: Optional[np.ndarray] = None
+    trigger_name: str = ""
 
 
 @dataclass
@@ -107,10 +108,14 @@ class LoadedDoricFile:
 
         trig_t = None
         trig = None
+        trig_name = trigger_name or ""
+
         if trigger_name:
             if self.digital_time is not None and trigger_name in self.digital_by_name:
                 trig_t = self.digital_time
                 trig = self.digital_by_name[trigger_name]
+
+                # align analog signals to DIO time base
                 if trig_t is not None and trig_t.size and t.size and trig_t.size != t.size:
                     sig = np.interp(trig_t, t, sig)
                     ref = np.interp(trig_t, t, ref)
@@ -127,6 +132,7 @@ class LoadedDoricFile:
             sampling_rate=float(fs) if np.isfinite(fs) else np.nan,
             trigger_time=np.asarray(trig_t, float) if trig_t is not None else None,
             trigger=np.asarray(trig, float) if trig is not None else None,
+            trigger_name=trig_name,
         )
 
 
@@ -139,21 +145,23 @@ class ProcessedTrial:
     raw_signal: np.ndarray
     raw_reference: np.ndarray
 
-    # For display: threshold envelope on raw 465
+    # raw threshold envelope on 465 (for display)
     raw_thr_hi: Optional[np.ndarray] = None
     raw_thr_lo: Optional[np.ndarray] = None
 
-    # Post-filter + decimation outputs
+    # optional DIO aligned to processed time
+    dio: Optional[np.ndarray] = None
+    dio_name: str = ""
+
+    # processing outputs
     sig_f: Optional[np.ndarray] = None
     ref_f: Optional[np.ndarray] = None
-
     baseline_sig: Optional[np.ndarray] = None
     baseline_ref: Optional[np.ndarray] = None
 
     output: Optional[np.ndarray] = None
     output_label: str = ""
 
-    # Diagnostics
     artifact_regions_sec: Optional[List[Tuple[float, float]]] = None
 
     fs_actual: float = np.nan
@@ -181,14 +189,28 @@ def safe_stem_from_metadata(path: str, channel: str, meta: Dict[str, str]) -> st
 
 def export_processed_csv(path: str, processed: ProcessedTrial) -> None:
     import csv
+
     t = np.asarray(processed.time, float)
     out = np.asarray(processed.output if processed.output is not None else np.full_like(t, np.nan), float)
 
+    dio = None
+    if processed.dio is not None and processed.dio.size == t.size:
+        dio = np.asarray(processed.dio, float)
+
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["time", "output"])
-        for i in range(t.size):
-            w.writerow([float(t[i]), float(out[i]) if np.isfinite(out[i]) else np.nan])
+        if dio is None:
+            w.writerow(["time", "output"])
+            for i in range(t.size):
+                w.writerow([float(t[i]), float(out[i]) if np.isfinite(out[i]) else np.nan])
+        else:
+            w.writerow(["time", "output", "dio"])
+            for i in range(t.size):
+                w.writerow([
+                    float(t[i]),
+                    float(out[i]) if np.isfinite(out[i]) else np.nan,
+                    float(dio[i]) if np.isfinite(dio[i]) else np.nan,
+                ])
 
 
 def export_processed_h5(path: str, processed: ProcessedTrial, metadata: Optional[Dict[str, str]] = None) -> None:
@@ -203,6 +225,10 @@ def export_processed_h5(path: str, processed: ProcessedTrial, metadata: Optional
 
         g.create_dataset("raw_465", data=np.asarray(processed.raw_signal, float), compression="gzip")
         g.create_dataset("raw_405", data=np.asarray(processed.raw_reference, float), compression="gzip")
+
+        if processed.dio is not None:
+            g.create_dataset("dio", data=np.asarray(processed.dio, float), compression="gzip")
+            g.attrs["dio_name"] = str(processed.dio_name)
 
         if processed.baseline_sig is not None:
             g.create_dataset("baseline_465", data=np.asarray(processed.baseline_sig, float), compression="gzip")
@@ -268,9 +294,6 @@ def apply_manual_regions(time: np.ndarray, mask: np.ndarray, regions: List[Tuple
 
 
 def _lowpass_sos(x: np.ndarray, fs: float, cutoff: float, order: int) -> np.ndarray:
-    """
-    More stable than filtfilt(b,a), and usually reduces start/end artifacts.
-    """
     if not np.isfinite(fs) or fs <= 0 or cutoff <= 0:
         return np.asarray(x, float)
 
@@ -281,14 +304,10 @@ def _lowpass_sos(x: np.ndarray, fs: float, cutoff: float, order: int) -> np.ndar
     nyq = 0.5 * fs
     wn = min(0.999, max(1e-6, cutoff / nyq))
     sos = butter(order, wn, btype="low", output="sos")
-    # sosfiltfilt uses reflection padding internally; generally cleaner edges
     return np.asarray(sosfiltfilt(sos, y), float)
 
 
 def _compute_resample_ratio(fs: float, target_fs: float) -> Tuple[int, int, float]:
-    """
-    Determine integer up/down for resample_poly so that fs*(up/down) ≈ target_fs.
-    """
     from fractions import Fraction
     ratio = float(target_fs) / float(fs)
     frac = Fraction(ratio).limit_denominator(2000)
@@ -304,10 +323,6 @@ def _resample_pair_to_target_fs(
     fs: float,
     target_fs: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """
-    Resample both traces using the exact same up/down and padding, ensuring identical length.
-    Using padtype='line' prevents the “messy beginning” seen with default padding.
-    """
     t = np.asarray(t, float)
     x1 = np.asarray(x1, float)
     x2 = np.asarray(x2, float)
@@ -315,14 +330,12 @@ def _resample_pair_to_target_fs(
     if not np.isfinite(fs) or fs <= 0 or not np.isfinite(target_fs) or target_fs <= 0:
         return t, x1, x2, fs
 
-    # If already near target, keep
     if fs <= target_fs * 1.05:
         return t, x1, x2, fs
 
     up, down, fs_used = _compute_resample_ratio(fs, target_fs)
 
     def _rp(x: np.ndarray) -> np.ndarray:
-        # prefer padtype='line' to avoid startup artifacts
         try:
             return resample_poly(x, up, down, padtype="line")
         except TypeError:
@@ -342,9 +355,6 @@ def _resample_pair_to_target_fs(
 
 
 def _compute_signal_envelope(t: np.ndarray, x: np.ndarray, k: float, mode: str, window_s: float) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Envelope for visualization: median ± k*MAD(signal), global or windowed.
-    """
     y = np.asarray(x, float)
     if y.size == 0:
         return y.copy(), y.copy()
@@ -455,14 +465,7 @@ def compute_motion_corrected_dff(sig_f, ref_f, b_sig, b_ref):
     fitted_ref = (a * dff_ref_raw + b)
     dff_mc = dff_sig_raw - fitted_ref
 
-    return {
-        "sig_det": dff_sig_raw,
-        "ref_det": dff_ref_raw,
-        "a": a,
-        "b": b,
-        "delta_mc": dff_mc,
-        "dff": dff_mc,
-    }
+    return {"dff": dff_mc}
 
 
 def zscore_median_std(x: np.ndarray) -> np.ndarray:
@@ -482,8 +485,14 @@ class _TaskSignals(QtCore.QObject):
 
 
 class PreviewTask(QtCore.QRunnable):
-    def __init__(self, processor: "PhotometryProcessor", trial: LoadedTrial, params: ProcessingParams,
-                 manual_regions_sec: List[Tuple[float, float]], job_id: int):
+    def __init__(
+        self,
+        processor: "PhotometryProcessor",
+        trial: LoadedTrial,
+        params: ProcessingParams,
+        manual_regions_sec: List[Tuple[float, float]],
+        job_id: int,
+    ):
         super().__init__()
         self.setAutoDelete(True)
         self.processor = processor
@@ -609,7 +618,7 @@ class PhotometryProcessor:
             1.0 / float(np.nanmedian(np.diff(t))) if t.size > 2 else np.nan
         )
 
-        # Envelope on raw 465 (for display)
+        # Envelope (for display) computed on raw 465
         hi_raw, lo_raw = _compute_signal_envelope(
             t, sig, float(params.mad_k), str(params.artifact_mode), float(params.adaptive_window_s)
         )
@@ -622,7 +631,7 @@ class PhotometryProcessor:
 
         mask = apply_manual_regions(t, mask, manual_regions_sec or [])
 
-        # Apply mask and interpolate gaps
+        # Mask and interpolate
         sig_corr = sig.copy(); sig_corr[mask] = np.nan
         ref_corr = ref.copy(); ref_corr[mask] = np.nan
         sig_corr = interpolate_nans(sig_corr)
@@ -637,24 +646,30 @@ class PhotometryProcessor:
         sig_f = _lowpass_sos(sig_corr, fs, cutoff, int(params.filter_order))
         ref_f = _lowpass_sos(ref_corr, fs, cutoff, int(params.filter_order))
 
-        # Resample/decimate BOTH together (fixes mismatched edges and startup artifacts)
+        # Decimate/resample signals together
         t2, sig2, ref2, fs_used = _resample_pair_to_target_fs(t, sig_f, ref_f, fs, target_fs)
 
-        # Resample the threshold envelope for display (same ratio implicitly)
-        # We do it via same pair function to keep consistent padding/length
+        # Resample threshold envelope for display
         _, hi2, lo2, _ = _resample_pair_to_target_fs(t, hi_raw, lo_raw, fs, target_fs)
+
+        # DIO overlay (nearest/linear then binarize)
+        dio2 = None
+        dio_name = ""
+        if trial.trigger is not None and trial.trigger.size and trial.trigger_name:
+            dio_name = trial.trigger_name
+            # trial.time is already aligned to DIO time base if selected
+            dio_interp = np.interp(t2, t, np.asarray(trial.trigger, float))
+            dio2 = (dio_interp > 0.5).astype(float)
 
         # Baseline AFTER filtering + decimation
         b_sig = self._baseline(t2, sig2, params)
         b_ref = self._baseline(t2, ref2, params)
 
-        # Outputs
         mode = params.output_mode if params.output_mode in OUTPUT_MODES else OUTPUT_MODES[0]
         out = None
 
         if mode == "dF/F (standardized motion corrected)":
-            out_dict = compute_motion_corrected_dff(sig2, ref2, b_sig, b_ref)
-            out = out_dict["dff"]
+            out = compute_motion_corrected_dff(sig2, ref2, b_sig, b_ref)["dff"]
 
         elif mode == "dF/F (motion corrected, detrended regression)":
             sig_det = sig2 - b_sig
@@ -695,10 +710,12 @@ class PhotometryProcessor:
             path=trial.path,
             channel_id=trial.channel_id,
             time=t2,
-            raw_signal=sig2,          # decimated (stable)
-            raw_reference=ref2,       # decimated (stable)
+            raw_signal=sig2,
+            raw_reference=ref2,
             raw_thr_hi=hi2,
             raw_thr_lo=lo2,
+            dio=dio2,
+            dio_name=dio_name,
             sig_f=sig2,
             ref_f=ref2,
             baseline_sig=b_sig,

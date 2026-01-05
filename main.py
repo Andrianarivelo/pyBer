@@ -31,7 +31,7 @@ from analysis_core import (
 from gui_preprocessing import FileQueuePanel, ParameterPanel, PlotDashboard, MetadataDialog, ArtifactPanel
 from gui_postprocessing import PostProcessingPanel
 from styles import APP_QSS
-
+import numpy as np
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
@@ -525,11 +525,39 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str, str)
     def _post_get_dio_data_for_path(self, path: str, dio_name: str):
-        f = self._loaded_files.get(path)
-        if not f or not f.digital_time or dio_name not in f.digital_by_name:
-            self.post_tab.receive_dio_data(path, dio_name, None, None)
-            return
-        self.post_tab.receive_dio_data(path, dio_name, f.digital_time, f.digital_by_name[dio_name])
+        """
+        Returns (t_dio, y_dio) for the requested dio_name for a given *raw* path
+        currently loaded/parsed in the cache.
+
+        Fixes numpy array truth-value ambiguity by checking None/len explicitly.
+        """
+        f = self._raw_cache.get(path, None)
+
+        if f is None:
+            return None, None
+
+        # digital_time may be a numpy array
+        if getattr(f, "digital_time", None) is None:
+            return None, None
+
+        t_dio = np.asarray(f.digital_time)
+        if t_dio.size == 0:
+            return None, None
+
+        digital_map = getattr(f, "digital_by_name", None)
+        if not isinstance(digital_map, dict) or dio_name not in digital_map:
+            return None, None
+
+        y_dio = np.asarray(digital_map[dio_name])
+        if y_dio.size == 0:
+            return None, None
+
+        # Ensure same length
+        n = min(t_dio.size, y_dio.size)
+        t_dio = t_dio[:n]
+        y_dio = y_dio[:n]
+
+        return t_dio, y_dio
 
     def closeEvent(self, event):
         self._save_settings()
