@@ -86,6 +86,8 @@ The GUI exposes seven explicit output definitions:
 1. Create the environment:
    ```bash
    conda env create -f requirements.yml
+## Run
+  conda env create -f requirements.yml
 
 ## Usage workflow
 
