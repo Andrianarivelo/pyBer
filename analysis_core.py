@@ -13,58 +13,103 @@ import h5py
 from scipy.signal import butter, sosfiltfilt, resample_poly
 from PySide6 import QtCore  # for QRunnable signals
 
+# Optional: Lasso (requires scikit-learn). If unavailable, we fall back to OLS.
 try:
     from sklearn.linear_model import Lasso
 except Exception:
     Lasso = None
 
+# Baseline correction (pybaselines)
 try:
     from pybaselines.api import Baseline
 except Exception:
     from pybaselines import Baseline
 
 
-# ----------------------------- Data models -----------------------------
+# =============================================================================
+# Data models and user-facing option lists
+# =============================================================================
 
 BASELINE_METHODS = ["asls", "arpls", "airpls"]
 
+# Fitting methods for "fitted reference" motion correction.
+# - OLS: ordinary least squares
+# - Lasso: sparse regression (requires sklearn)
+# - RLM (HuberT): robust regression via IRLS with Huber weighting (no extra deps)
+REFERENCE_FIT_METHODS = [
+    "OLS (recommended)",
+    "Lasso",
+    "RLM (HuberT)",
+]
+
+# Output modes (user requested: 7 clear options)
 OUTPUT_MODES = [
-    "dF/F (standardized motion corrected)",   # DEFAULT
-    "dF/F (motion corrected, detrended regression)",
-    "dF/F (regression in z-space)",
-    "z-score (subtraction; baseline-subtracted)",
+    # 1) dFF (non motion corrected)
+    "dFF (non motion corrected)",
+    # 2) zscore of dFF (non motion corrected)
+    "zscore (non motion corrected)",
+    # 3) dFF motion corrected via subtraction (dFF_sig - dFF_ref)
+    "dFF (motion corrected via subtraction)",
+    # 4) zscore of dFF motion corrected via subtraction
+    "zscore (motion corrected via subtraction)",
+    # 5) zscore(subtractions) = z(dFF_sig) - z(dFF_ref)
+    "zscore (subtractions)",
+    # 6) dFF motion corrected with fitted ref = (sig_f - fitted_ref) / fitted_ref
+    "dFF (motion corrected with fitted ref)",
+    # 7) zscore of that fitted-ref dFF
+    "zscore (motion corrected with fitted ref)",
 ]
 
 
 @dataclass
 class ProcessingParams:
-    # Artifact
+    # -------------------------
+    # Artifact detection
+    # -------------------------
     artifact_mode: str = "Global MAD (dx)"  # or "Adaptive MAD (windowed)"
     mad_k: float = 8.0
     adaptive_window_s: float = 5.0
     artifact_pad_s: float = 0.25
 
+    # -------------------------
     # Filtering
+    # -------------------------
     lowpass_hz: float = 12.0
     filter_order: int = 3
 
+    # -------------------------
     # Decimation / resampling
+    # -------------------------
     target_fs_hz: float = 100.0
 
+    # -------------------------
     # Baseline via pybaselines
+    # -------------------------
     baseline_method: str = "airpls"  # asls | arpls | airpls
-    baseline_lambda: float = 1e9    # "gamma/lambda" (UI shows as x e y)
+    baseline_lambda: float = 1e9
     baseline_diff_order: int = 2
     baseline_max_iter: int = 50
     baseline_tol: float = 1e-3
     asls_p: float = 0.01
 
-    # Output
-    output_mode: str = "dF/F (standardized motion corrected)"
+    # -------------------------
+    # Output selection
+    # -------------------------
+    # Default chosen to be explicit and widely used in photometry workflows.
+    output_mode: str = "dFF (motion corrected with fitted ref)"
 
-    # Optional regression (for alternative mode)
-    reference_fit: str = "OLS (recommended)"  # or "Lasso"
+    # -------------------------
+    # Reference fit options (used by "fitted ref" output modes)
+    # -------------------------
+    reference_fit: str = "OLS (recommended)"  # OLS | Lasso | RLM (HuberT)
+
+    # Lasso hyperparameter (only used if reference_fit == "Lasso")
     lasso_alpha: float = 1e-3
+
+    # Robust regression (Huber) hyperparameters (only used if reference_fit == "RLM (HuberT)")
+    rlm_huber_t: float = 1.345  # classic Huber threshold (in sigma units)
+    rlm_max_iter: int = 50
+    rlm_tol: float = 1e-6
 
     def to_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -115,7 +160,7 @@ class LoadedDoricFile:
                 trig_t = self.digital_time
                 trig = self.digital_by_name[trigger_name]
 
-                # align analog signals to DIO time base
+                # Align analog signals to DIO time base (so DIO overlays correctly).
                 if trig_t is not None and trig_t.size and t.size and trig_t.size != t.size:
                     sig = np.interp(trig_t, t, sig)
                     ref = np.interp(trig_t, t, ref)
@@ -145,20 +190,21 @@ class ProcessedTrial:
     raw_signal: np.ndarray
     raw_reference: np.ndarray
 
-    # raw threshold envelope on 465 (for display)
+    # Threshold envelope on 465 (for display only)
     raw_thr_hi: Optional[np.ndarray] = None
     raw_thr_lo: Optional[np.ndarray] = None
 
-    # optional DIO aligned to processed time
+    # Optional DIO aligned to processed time
     dio: Optional[np.ndarray] = None
     dio_name: str = ""
 
-    # processing outputs
+    # Processing intermediates
     sig_f: Optional[np.ndarray] = None
     ref_f: Optional[np.ndarray] = None
     baseline_sig: Optional[np.ndarray] = None
     baseline_ref: Optional[np.ndarray] = None
 
+    # Final selected output
     output: Optional[np.ndarray] = None
     output_label: str = ""
 
@@ -169,7 +215,9 @@ class ProcessedTrial:
     fs_used: float = np.nan
 
 
-# ----------------------------- Export helpers -----------------------------
+# =============================================================================
+# Export helpers
+# =============================================================================
 
 def safe_stem_from_metadata(path: str, channel: str, meta: Dict[str, str]) -> str:
     base = os.path.splitext(os.path.basename(path))[0]
@@ -191,7 +239,10 @@ def export_processed_csv(path: str, processed: ProcessedTrial) -> None:
     import csv
 
     t = np.asarray(processed.time, float)
-    out = np.asarray(processed.output if processed.output is not None else np.full_like(t, np.nan), float)
+    out = np.asarray(
+        processed.output if processed.output is not None else np.full_like(t, np.nan),
+        float,
+    )
 
     dio = None
     if processed.dio is not None and processed.dio.size == t.size:
@@ -241,9 +292,12 @@ def export_processed_h5(path: str, processed: ProcessedTrial, metadata: Optional
                 mg.attrs[str(k)] = str(v)
 
 
-# ----------------------------- Math helpers -----------------------------
+# =============================================================================
+# Math helpers
+# =============================================================================
 
 def _mad(x: np.ndarray) -> float:
+    """Median Absolute Deviation scaled to be comparable to std for normal data."""
     x = np.asarray(x, float)
     x = x[np.isfinite(x)]
     if x.size == 0:
@@ -253,6 +307,7 @@ def _mad(x: np.ndarray) -> float:
 
 
 def interpolate_nans(y: np.ndarray) -> np.ndarray:
+    """Linear interpolation over NaNs (used after masking artifacts)."""
     y = np.asarray(y, float).copy()
     bad = ~np.isfinite(y)
     if not np.any(bad):
@@ -265,6 +320,7 @@ def interpolate_nans(y: np.ndarray) -> np.ndarray:
 
 
 def regions_from_mask(time: np.ndarray, mask: np.ndarray) -> List[Tuple[float, float]]:
+    """Convert a boolean mask into contiguous time regions (start, end) for display/export."""
     t = np.asarray(time, float)
     m = np.asarray(mask, bool)
     idx = np.where(m)[0]
@@ -285,6 +341,7 @@ def regions_from_mask(time: np.ndarray, mask: np.ndarray) -> List[Tuple[float, f
 
 
 def apply_manual_regions(time: np.ndarray, mask: np.ndarray, regions: List[Tuple[float, float]]) -> np.ndarray:
+    """OR a user-provided list of regions (sec) into the artifact mask."""
     t = np.asarray(time, float)
     m = np.asarray(mask, bool).copy()
     for (a, b) in (regions or []):
@@ -294,6 +351,7 @@ def apply_manual_regions(time: np.ndarray, mask: np.ndarray, regions: List[Tuple
 
 
 def _lowpass_sos(x: np.ndarray, fs: float, cutoff: float, order: int) -> np.ndarray:
+    """Zero-phase low-pass filtering with a Butterworth SOS filter."""
     if not np.isfinite(fs) or fs <= 0 or cutoff <= 0:
         return np.asarray(x, float)
 
@@ -308,6 +366,7 @@ def _lowpass_sos(x: np.ndarray, fs: float, cutoff: float, order: int) -> np.ndar
 
 
 def _compute_resample_ratio(fs: float, target_fs: float) -> Tuple[int, int, float]:
+    """Compute a rational resampling ratio (up/down) limited to manageable denominators."""
     from fractions import Fraction
     ratio = float(target_fs) / float(fs)
     frac = Fraction(ratio).limit_denominator(2000)
@@ -323,6 +382,10 @@ def _resample_pair_to_target_fs(
     fs: float,
     target_fs: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """
+    Resample two signals together (preserving alignment) using polyphase filtering.
+    We only resample if fs is substantially above target_fs (i.e., true decimation).
+    """
     t = np.asarray(t, float)
     x1 = np.asarray(x1, float)
     x2 = np.asarray(x2, float)
@@ -330,12 +393,14 @@ def _resample_pair_to_target_fs(
     if not np.isfinite(fs) or fs <= 0 or not np.isfinite(target_fs) or target_fs <= 0:
         return t, x1, x2, fs
 
+    # If already near/below target, do not resample (avoid unnecessary distortion).
     if fs <= target_fs * 1.05:
         return t, x1, x2, fs
 
     up, down, fs_used = _compute_resample_ratio(fs, target_fs)
 
     def _rp(x: np.ndarray) -> np.ndarray:
+        # resample_poly signature differs across SciPy versions (padtype optional)
         try:
             return resample_poly(x, up, down, padtype="line")
         except TypeError:
@@ -354,7 +419,17 @@ def _resample_pair_to_target_fs(
     return t_new, np.asarray(y1, float), np.asarray(y2, float), fs_used
 
 
-def _compute_signal_envelope(t: np.ndarray, x: np.ndarray, k: float, mode: str, window_s: float) -> Tuple[np.ndarray, np.ndarray]:
+def _compute_signal_envelope(
+    t: np.ndarray,
+    x: np.ndarray,
+    k: float,
+    mode: str,
+    window_s: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute a high/low "envelope" for display, based on median +/- k * MAD.
+    In adaptive mode, median and MAD are computed in sliding windows.
+    """
     y = np.asarray(x, float)
     if y.size == 0:
         return y.copy(), y.copy()
@@ -387,6 +462,12 @@ def _compute_signal_envelope(t: np.ndarray, x: np.ndarray, k: float, mode: str, 
 
 
 def detect_artifacts_global_dx(time: np.ndarray, x: np.ndarray, k: float, pad_s: float) -> np.ndarray:
+    """
+    Artifact detection via derivative thresholding:
+    - Compute dx
+    - Threshold |dx| > k * MAD(dx)
+    - Optionally pad around detections (pad_s)
+    """
     t = np.asarray(time, float)
     y = np.asarray(x, float)
     dx = np.diff(y, prepend=y[0])
@@ -409,6 +490,11 @@ def detect_artifacts_global_dx(time: np.ndarray, x: np.ndarray, k: float, pad_s:
 
 
 def detect_artifacts_adaptive(time: np.ndarray, x: np.ndarray, k: float, window_s: float, pad_s: float) -> np.ndarray:
+    """
+    Artifact detection via windowed derivative thresholding:
+    - For each window: threshold |dx| > k * MAD(dx_window)
+    - Optionally pad around detections (pad_s)
+    """
     t = np.asarray(time, float)
     y = np.asarray(x, float)
     dx = np.diff(y, prepend=y[0])
@@ -440,7 +526,21 @@ def detect_artifacts_adaptive(time: np.ndarray, x: np.ndarray, k: float, window_
     return mask
 
 
-def ols_fit(x, y):
+def zscore_median_std(x: np.ndarray) -> np.ndarray:
+    """
+    Z-score using median centering and standard deviation scaling.
+    This is slightly more outlier-robust than mean-centering, while still using std.
+    """
+    x = np.asarray(x, float)
+    med = np.nanmedian(x)
+    sd = np.nanstd(x)
+    if not np.isfinite(sd) or sd <= 1e-12:
+        return np.full_like(x, np.nan)
+    return (x - med) / sd
+
+
+def ols_fit(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    """Fit y ≈ a*x + b with ordinary least squares (finite samples only)."""
     x = np.asarray(x, float)
     y = np.asarray(y, float)
     m = np.isfinite(x) & np.isfinite(y)
@@ -451,33 +551,132 @@ def ols_fit(x, y):
     return float(coef[0]), float(coef[1])
 
 
-def compute_motion_corrected_dff(sig_f, ref_f, b_sig, b_ref):
-    den_sig = np.asarray(b_sig, float).copy()
-    den_sig[np.abs(den_sig) < 1e-12] = np.nan
+def _rlm_huber_fit(
+    x: np.ndarray,
+    y: np.ndarray,
+    huber_t: float = 1.345,
+    max_iter: int = 50,
+    tol: float = 1e-6,
+) -> Tuple[float, float]:
+    """
+    Robust linear regression y ≈ a*x + b using IRLS with Huber weights.
 
-    den_ref = np.asarray(b_ref, float).copy()
-    den_ref[np.abs(den_ref) < 1e-12] = np.nan
+    Weighting:
+      r_i = y_i - (a*x_i + b)
+      s   = robust scale estimate (MAD of residuals)
+      u_i = r_i / s
+      w_i = 1                    if |u_i| <= t
+            t / |u_i|            if |u_i| >  t
 
-    dff_sig_raw = (sig_f - b_sig) / den_sig
-    dff_ref_raw = (ref_f - b_ref) / den_ref
-
-    a, b = ols_fit(dff_ref_raw, dff_sig_raw)
-    fitted_ref = (a * dff_ref_raw + b)
-    dff_mc = dff_sig_raw - fitted_ref
-
-    return {"dff": dff_mc}
-
-
-def zscore_median_std(x: np.ndarray) -> np.ndarray:
+    Returns:
+      (a, b)
+    """
     x = np.asarray(x, float)
-    med = np.nanmedian(x)
-    sd = np.nanstd(x)
-    if not np.isfinite(sd) or sd <= 1e-12:
-        return np.full_like(x, np.nan)
-    return (x - med) / sd
+    y = np.asarray(y, float)
+    m = np.isfinite(x) & np.isfinite(y)
+    if np.sum(m) < 10:
+        return 1.0, 0.0
+
+    xx = x[m]
+    yy = y[m]
+
+    # Initialize with OLS
+    a, b = ols_fit(xx, yy)
+
+    # IRLS loop
+    for _ in range(int(max_iter)):
+        yhat = a * xx + b
+        r = yy - yhat
+
+        s = _mad(r)
+        if not np.isfinite(s) or s <= 1e-12:
+            break
+
+        u = r / s
+        absu = np.abs(u)
+
+        # Huber weights
+        w = np.ones_like(absu, dtype=float)
+        big = absu > float(huber_t)
+        w[big] = float(huber_t) / absu[big]
+
+        # Weighted least squares solve
+        # Solve min || sqrt(w) * (yy - (a*xx + b)) ||^2
+        W = np.sqrt(w)
+        Xw = np.vstack([xx * W, W]).T
+        yw = yy * W
+        coef, *_ = np.linalg.lstsq(Xw, yw, rcond=None)
+        a_new, b_new = float(coef[0]), float(coef[1])
+
+        if (abs(a_new - a) + abs(b_new - b)) < float(tol):
+            a, b = a_new, b_new
+            break
+
+        a, b = a_new, b_new
+
+    return float(a), float(b)
 
 
-# ----------------------------- Worker task (stable) -----------------------------
+def fit_reference_to_signal(
+    ref: np.ndarray,
+    sig: np.ndarray,
+    params: ProcessingParams,
+) -> Tuple[float, float]:
+    """
+    Fit sig ≈ a*ref + b using the selected method in params.reference_fit.
+
+    Notes:
+    - For Lasso: if sklearn is unavailable, we fall back to OLS.
+    - For RLM (HuberT): we use an internal IRLS implementation.
+    """
+    x = np.asarray(ref, float)
+    y = np.asarray(sig, float)
+    m = np.isfinite(x) & np.isfinite(y)
+
+    if np.sum(m) < 10:
+        return 1.0, 0.0
+
+    method = str(params.reference_fit or "OLS (recommended)")
+
+    # --- Lasso ---
+    if method.startswith("Lasso"):
+        if Lasso is None:
+            return ols_fit(x, y)
+        model = Lasso(
+            alpha=float(params.lasso_alpha),
+            fit_intercept=True,
+            max_iter=5000,
+        )
+        model.fit(x[m].reshape(-1, 1), y[m])
+        a = float(model.coef_[0])
+        b = float(model.intercept_)
+        return a, b
+
+    # --- Robust regression: Huber ---
+    if method.startswith("RLM"):
+        return _rlm_huber_fit(
+            x,
+            y,
+            huber_t=float(params.rlm_huber_t),
+            max_iter=int(params.rlm_max_iter),
+            tol=float(params.rlm_tol),
+        )
+
+    # --- Default: OLS ---
+    return ols_fit(x, y)
+
+
+def safe_divide(num: np.ndarray, den: np.ndarray) -> np.ndarray:
+    """Elementwise division with protection against near-zero denominators."""
+    num = np.asarray(num, float)
+    den = np.asarray(den, float).copy()
+    den[np.abs(den) < 1e-12] = np.nan
+    return num / den
+
+
+# =============================================================================
+# Worker task (stable)
+# =============================================================================
 
 class _TaskSignals(QtCore.QObject):
     finished = QtCore.Signal(object, int, float)  # (ProcessedTrial, job_id, elapsed_s)
@@ -511,7 +710,9 @@ class PreviewTask(QtCore.QRunnable):
             self.signals.failed.emit(str(e), self.job_id)
 
 
-# ----------------------------- Processor -----------------------------
+# =============================================================================
+# Processor
+# =============================================================================
 
 class PhotometryProcessor:
     def load_file(self, path: str) -> LoadedDoricFile:
@@ -541,6 +742,7 @@ class PhotometryProcessor:
                 ref = np.asarray(base["LockInAOUT01"][ch][()], float)
                 t_ref = _read_time("LockInAOUT01")
 
+                # Best-effort time vector selection (Doric exports can vary)
                 if t_sig.size == sig.size:
                     t = t_sig
                 elif t_ref.size == sig.size:
@@ -549,6 +751,7 @@ class PhotometryProcessor:
                     dt = float(np.nanmedian(np.diff(t_sig))) if t_sig.size > 1 else 1.0 / 1000.0
                     t = np.arange(sig.size, dtype=float) * dt
 
+                # Ensure reference matches signal length (interp if possible; otherwise resize)
                 if ref.size != sig.size and t_ref.size == ref.size:
                     ref = np.interp(t, t_ref, ref)
                 elif ref.size != sig.size:
@@ -578,11 +781,24 @@ class PhotometryProcessor:
                 digital_by_name=digital_by,
             )
 
-    def make_preview_task(self, trial: LoadedTrial, params: ProcessingParams,
-                          manual_regions_sec: List[Tuple[float, float]], job_id: int) -> PreviewTask:
+    def make_preview_task(
+        self,
+        trial: LoadedTrial,
+        params: ProcessingParams,
+        manual_regions_sec: List[Tuple[float, float]],
+        job_id: int,
+    ) -> PreviewTask:
         return PreviewTask(self, trial, params, manual_regions_sec, job_id)
 
     def _baseline(self, t: np.ndarray, x: np.ndarray, params: ProcessingParams) -> np.ndarray:
+        """
+        Estimate baseline for a trace using pybaselines.
+
+        Baseline is computed AFTER filtering and any resampling, so that:
+        - artifacts are already removed/interpolated
+        - bandwidth is controlled (less baseline leakage)
+        - signals are aligned and at the final timebase
+        """
         fitter = Baseline(x_data=t)
         method = (params.baseline_method or "airpls").lower()
         if method not in BASELINE_METHODS:
@@ -600,6 +816,7 @@ class PhotometryProcessor:
         if method == "arpls":
             b, _ = fitter.arpls(x, lam=lam, diff_order=diff_order, max_iter=max_iter, tol=tol)
             return np.asarray(b, float)
+
         b, _ = fitter.airpls(x, lam=lam, diff_order=diff_order, max_iter=max_iter, tol=tol)
         return np.asarray(b, float)
 
@@ -610,6 +827,9 @@ class PhotometryProcessor:
         manual_regions_sec: Optional[List[Tuple[float, float]]] = None,
         preview_mode: bool = False,
     ) -> ProcessedTrial:
+        # ---------------------------------------------------------------------
+        # 1) Load raw arrays
+        # ---------------------------------------------------------------------
         t = np.asarray(trial.time, float)
         sig = np.asarray(trial.signal_465, float)
         ref = np.asarray(trial.reference_405, float)
@@ -618,26 +838,44 @@ class PhotometryProcessor:
             1.0 / float(np.nanmedian(np.diff(t))) if t.size > 2 else np.nan
         )
 
-        # Envelope (for display) computed on raw 465
+        # ---------------------------------------------------------------------
+        # 2) Display envelope on raw 465 (computed pre-masking for user context)
+        # ---------------------------------------------------------------------
         hi_raw, lo_raw = _compute_signal_envelope(
-            t, sig, float(params.mad_k), str(params.artifact_mode), float(params.adaptive_window_s)
+            t,
+            sig,
+            float(params.mad_k),
+            str(params.artifact_mode),
+            float(params.adaptive_window_s),
         )
 
-        # Artifact detection on raw 465
-        if params.artifact_mode.startswith("Adaptive"):
-            mask = detect_artifacts_adaptive(t, sig, params.mad_k, params.adaptive_window_s, params.artifact_pad_s)
+        # ---------------------------------------------------------------------
+        # 3) Artifact detection on raw 465, then apply manual regions
+        # ---------------------------------------------------------------------
+        if str(params.artifact_mode).startswith("Adaptive"):
+            mask = detect_artifacts_adaptive(
+                t, sig, float(params.mad_k), float(params.adaptive_window_s), float(params.artifact_pad_s)
+            )
         else:
-            mask = detect_artifacts_global_dx(t, sig, params.mad_k, params.artifact_pad_s)
+            mask = detect_artifacts_global_dx(
+                t, sig, float(params.mad_k), float(params.artifact_pad_s)
+            )
 
         mask = apply_manual_regions(t, mask, manual_regions_sec or [])
 
-        # Mask and interpolate
-        sig_corr = sig.copy(); sig_corr[mask] = np.nan
-        ref_corr = ref.copy(); ref_corr[mask] = np.nan
+        # ---------------------------------------------------------------------
+        # 4) Mask artifacts (set NaN) then interpolate (keeps timebase intact)
+        # ---------------------------------------------------------------------
+        sig_corr = sig.copy()
+        ref_corr = ref.copy()
+        sig_corr[mask] = np.nan
+        ref_corr[mask] = np.nan
         sig_corr = interpolate_nans(sig_corr)
         ref_corr = interpolate_nans(ref_corr)
 
-        # Filtering BEFORE decimation (anti-alias)
+        # ---------------------------------------------------------------------
+        # 5) Low-pass filter before decimation (anti-aliasing)
+        # ---------------------------------------------------------------------
         target_fs = float(params.target_fs_hz)
         cutoff = float(params.lowpass_hz)
         if np.isfinite(fs) and np.isfinite(target_fs) and fs > target_fs * 1.05:
@@ -646,66 +884,91 @@ class PhotometryProcessor:
         sig_f = _lowpass_sos(sig_corr, fs, cutoff, int(params.filter_order))
         ref_f = _lowpass_sos(ref_corr, fs, cutoff, int(params.filter_order))
 
-        # Decimate/resample signals together
+        # ---------------------------------------------------------------------
+        # 6) Resample signals together to target fs (only if true decimation)
+        # ---------------------------------------------------------------------
         t2, sig2, ref2, fs_used = _resample_pair_to_target_fs(t, sig_f, ref_f, fs, target_fs)
 
-        # Resample threshold envelope for display
+        # Resample the envelope for display (same timebase as processed)
         _, hi2, lo2, _ = _resample_pair_to_target_fs(t, hi_raw, lo_raw, fs, target_fs)
 
-        # DIO overlay (nearest/linear then binarize)
+        # ---------------------------------------------------------------------
+        # 7) DIO overlay (if present): interpolate and binarize
+        # ---------------------------------------------------------------------
         dio2 = None
         dio_name = ""
         if trial.trigger is not None and trial.trigger.size and trial.trigger_name:
             dio_name = trial.trigger_name
-            # trial.time is already aligned to DIO time base if selected
             dio_interp = np.interp(t2, t, np.asarray(trial.trigger, float))
             dio2 = (dio_interp > 0.5).astype(float)
 
-        # Baseline AFTER filtering + decimation
+        # ---------------------------------------------------------------------
+        # 8) Baseline estimation AFTER filtering/resampling (on final timebase)
+        # ---------------------------------------------------------------------
         b_sig = self._baseline(t2, sig2, params)
         b_ref = self._baseline(t2, ref2, params)
 
+        # ---------------------------------------------------------------------
+        # 9) Compute requested output mode (7 user-defined options)
+        # ---------------------------------------------------------------------
         mode = params.output_mode if params.output_mode in OUTPUT_MODES else OUTPUT_MODES[0]
-        out = None
+        out: Optional[np.ndarray] = None
 
-        if mode == "dF/F (standardized motion corrected)":
-            out = compute_motion_corrected_dff(sig2, ref2, b_sig, b_ref)["dff"]
+        # --- Compute baseline-referenced dFFs (building blocks) ---
+        # dFF_sig = (sig_filtered - baseline_sig) / baseline_sig
+        # dFF_ref = (ref_filtered - baseline_ref) / baseline_ref
+        dff_sig = safe_divide(sig2 - b_sig, b_sig)
+        dff_ref = safe_divide(ref2 - b_ref, b_ref)
 
-        elif mode == "dF/F (motion corrected, detrended regression)":
-            sig_det = sig2 - b_sig
-            ref_det = ref2 - b_ref
-            a, b = ols_fit(ref_det, sig_det)
-            delta_mc = sig_det - (a * ref_det + b)
-            den = b_sig.copy()
-            den[np.abs(den) < 1e-12] = np.nan
-            out = delta_mc / den
+        if mode == "dFF (non motion corrected)":
+            # (1) dFF (non motion corrected)
+            # dFF = (signal_filtered - signal_baseline) / signal_baseline
+            out = dff_sig
 
-        elif mode == "dF/F (regression in z-space)":
-            sig_det = sig2 - b_sig
-            ref_det = ref2 - b_ref
-            z_sig = zscore_median_std(sig_det)
-            z_ref = zscore_median_std(ref_det)
+        elif mode == "zscore (non motion corrected)":
+            # (2) zscore (non motion corrected)
+            # zscore(dFF_nonMC)
+            out = zscore_median_std(dff_sig)
 
-            if params.reference_fit.startswith("Lasso") and Lasso is not None:
-                good = np.isfinite(z_sig) & np.isfinite(z_ref)
-                if np.sum(good) > 50:
-                    model = Lasso(alpha=float(params.lasso_alpha), fit_intercept=True, max_iter=5000)
-                    model.fit(z_ref[good].reshape(-1, 1), z_sig[good])
-                    out = z_sig - model.predict(z_ref.reshape(-1, 1))
-                else:
-                    a, b = ols_fit(z_ref, z_sig)
-                    out = z_sig - (a * z_ref + b)
-            else:
-                a, b = ols_fit(z_ref, z_sig)
-                out = z_sig - (a * z_ref + b)
+        elif mode == "dFF (motion corrected via subtraction)":
+            # (3) dFF (motion corrected via subtraction)
+            # dFF_mc = dFF_sig - dFF_ref
+            out = dff_sig - dff_ref
 
-        elif mode == "z-score (subtraction; baseline-subtracted)":
-            sig_det = sig2 - b_sig
-            ref_det = ref2 - b_ref
-            z_sig = zscore_median_std(sig_det)
-            z_ref = zscore_median_std(ref_det)
-            out = z_sig - z_ref
+        elif mode == "zscore (motion corrected via subtraction)":
+            # (4) zscore (motion corrected via subtraction)
+            # zscore(dFF_sig - dFF_ref)
+            out = zscore_median_std(dff_sig - dff_ref)
 
+        elif mode == "zscore (subtractions)":
+            # (5) zscore (subtractions)
+            # zscore(dFF_sig) - zscore(dFF_ref)
+            out = zscore_median_std(dff_sig) - zscore_median_std(dff_ref)
+
+        elif mode == "dFF (motion corrected with fitted ref)":
+            # (6) dFF (motion corrected with fitted ref)
+            # 1) Fit reference (405) onto signal (465): fitted_ref = a*ref_filtered + b
+            # 2) Compute dFF using fitted reference denominator:
+            #    dFF = (sig_filtered - fitted_ref) / fitted_ref
+            a, b = fit_reference_to_signal(ref2, sig2, params)
+            fitted_ref = a * ref2 + b
+            out = safe_divide(sig2 - fitted_ref, fitted_ref)
+
+        elif mode == "zscore (motion corrected with fitted ref)":
+            # (7) zscore (motion corrected with fitted ref)
+            # zscore( (sig_filtered - fitted_ref) / fitted_ref )
+            a, b = fit_reference_to_signal(ref2, sig2, params)
+            fitted_ref = a * ref2 + b
+            dff_fit = safe_divide(sig2 - fitted_ref, fitted_ref)
+            out = zscore_median_std(dff_fit)
+
+        else:
+            # Safety fallback (should not happen if OUTPUT_MODES is authoritative)
+            out = dff_sig
+
+        # ---------------------------------------------------------------------
+        # 10) Package outputs
+        # ---------------------------------------------------------------------
         return ProcessedTrial(
             path=trial.path,
             channel_id=trial.channel_id,
