@@ -83,8 +83,44 @@ The GUI exposes seven explicit output definitions:
 
 ## Installation
 
-### Option A — Conda (recommended)
-
 1. Create the environment:
    ```bash
    conda env create -f requirements.yml
+
+   Usage Workflow
+
+Open a Doric .h5 file
+
+Choose a channel (e.g., AIN01).
+
+Optionally select a DigitalIO line to overlay events.
+
+QC & artifact removal
+
+Choose Global MAD (dx) or Adaptive MAD (windowed).
+
+Tune mad_k, window size, and padding.
+
+Add manual mask regions if needed.
+
+Filtering & resampling
+
+Set low-pass cutoff (Hz) and filter order.
+
+Set a target sampling rate (Hz) for consistent downstream analysis.
+
+Baseline estimation
+
+Choose asls, arpls, or airpls.
+
+Tune lambda and other parameters to avoid baseline leakage into fast transients.
+
+Select output
+
+Pick one of the 7 output modes.
+
+For “fitted ref” modes, choose the fit method (OLS/Lasso/RLM-HuberT).
+
+Export
+
+Export CSV/H5 for analysis in Python/MATLAB/R.
