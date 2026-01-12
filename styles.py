@@ -90,6 +90,17 @@ QPushButton[class="compactPrimary"] {
 QPushButton[class="compactPrimary"]:hover {
     background: #2b5a96;
 }
+QPushButton[class="help"] {
+    padding: 0;
+    border-radius: 11px;
+    min-width: 22px;
+    max-width: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    font-weight: 800;
+    background: #1b2a3f;
+    border: 1px solid #2a3c55;
+}
 
 /* Tabs */
 QTabWidget::pane {

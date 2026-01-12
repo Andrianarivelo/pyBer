@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
+import h5py
 
 from analysis_core import (
     PhotometryProcessor,
@@ -28,7 +29,7 @@ from analysis_core import (
     export_processed_h5,
     safe_stem_from_metadata,
 )
-from gui_preprocessing import FileQueuePanel, ParameterPanel, PlotDashboard, MetadataDialog, ArtifactPanel
+from gui_preprocessing import FileQueuePanel, ParameterPanel, PlotDashboard, MetadataDialog, ArtifactPanel, AdvancedOptionsDialog
 from gui_postprocessing import PostProcessingPanel
 from styles import APP_QSS
 import numpy as np
@@ -50,6 +51,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._manual_regions_by_key: Dict[Tuple[str, str], List[Tuple[float, float]]] = {}
         self._metadata_by_key: Dict[Tuple[str, str], Dict[str, str]] = {}
+        self._cutout_regions_by_key: Dict[Tuple[str, str], List[Tuple[float, float]]] = {}
+        self._sections_by_key: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
 
         self._last_processed: Dict[Tuple[str, str], ProcessedTrial] = {}
 
@@ -128,11 +131,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.file_panel.selectionChanged.connect(self._on_file_selection_changed)
         self.file_panel.channelChanged.connect(self._on_channel_changed)
         self.file_panel.triggerChanged.connect(self._on_trigger_changed)
+        self.file_panel.timeWindowChanged.connect(self._on_time_window_changed)
 
         self.file_panel.updatePreviewRequested.connect(self._trigger_preview)
         self.file_panel.metadataRequested.connect(self._edit_metadata_for_current)
         self.file_panel.exportRequested.connect(self._export_selected_or_all)
         self.file_panel.toggleArtifactsRequested.connect(self._toggle_artifacts_panel)
+        self.file_panel.advancedOptionsRequested.connect(self._open_advanced_options)
 
         # Parameters -> debounce preview
         self.param_panel.paramsChanged.connect(self._trigger_preview)
@@ -151,6 +156,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.post_tab.requestCurrentProcessed.connect(self._post_get_current_processed)
         self.post_tab.requestDioList.connect(self._post_get_current_dio_list)
         self.post_tab.requestDioData.connect(self._post_get_dio_data_for_path)
+
+        self.setAcceptDrops(True)
 
     # ---------------- Settings persistence ----------------
 
@@ -283,7 +290,167 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_trigger = trig if trig else None
         self._update_raw_plot()
 
+    def _on_time_window_changed(self) -> None:
+        self._last_processed.clear()
+        self._update_raw_plot()
+        self._trigger_preview()
+
+    def _open_advanced_options(self) -> None:
+        key = self._current_key()
+        if not key:
+            return
+        cutouts = self._cutout_regions_by_key.get(key, [])
+        sections = self._sections_by_key.get(key, [])
+        dlg = AdvancedOptionsDialog(cutouts, sections, self.param_panel.get_params(), self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        self._cutout_regions_by_key[key] = dlg.get_cutouts()
+        self._sections_by_key[key] = dlg.get_sections()
+        self._last_processed.clear()
+        self._update_raw_plot()
+        self._trigger_preview()
+
     # ---------------- Raw plot update ----------------
+
+    def _apply_time_window(self, trial: LoadedTrial) -> LoadedTrial:
+        start_s, end_s = self.file_panel.time_window()
+        if start_s is None and end_s is None:
+            return trial
+
+        t = np.asarray(trial.time, float)
+        if start_s is None:
+            mask = t <= float(end_s)
+        elif end_s is None:
+            mask = t >= float(start_s)
+        else:
+            if end_s <= start_s:
+                return trial
+            mask = (t >= float(start_s)) & (t <= float(end_s))
+        if np.sum(mask) < 2:
+            return trial
+
+        def _mask_arr(arr: Optional[np.ndarray], use_time_mask: bool) -> Optional[np.ndarray]:
+            if arr is None:
+                return None
+            if use_time_mask and arr.size == t.size:
+                return np.asarray(arr, float)[mask]
+            return np.asarray(arr, float)
+
+        time = t[mask]
+        sig = np.asarray(trial.signal_465, float)[mask]
+        ref = np.asarray(trial.reference_405, float)[mask]
+
+        trig_time = trial.trigger_time
+        trig = trial.trigger
+        if trig_time is not None and trig is not None:
+            if trig_time.size == t.size:
+                trig_time = _mask_arr(trig_time, True)
+                trig = _mask_arr(trig, True)
+            else:
+                if start_s is None:
+                    tmask = np.asarray(trig_time, float) <= float(end_s)
+                elif end_s is None:
+                    tmask = np.asarray(trig_time, float) >= float(start_s)
+                else:
+                    tmask = (trig_time >= float(start_s)) & (trig_time <= float(end_s))
+                trig_time = np.asarray(trig_time, float)[tmask]
+                trig = np.asarray(trig, float)[tmask]
+
+        fs = 1.0 / float(np.nanmedian(np.diff(time))) if time.size > 2 else np.nan
+
+        return LoadedTrial(
+            path=trial.path,
+            channel_id=trial.channel_id,
+            time=time,
+            signal_465=sig,
+            reference_405=ref,
+            sampling_rate=float(fs) if np.isfinite(fs) else np.nan,
+            trigger_time=trig_time,
+            trigger=trig,
+            trigger_name=trial.trigger_name,
+        )
+
+    def _apply_cutouts(self, trial: LoadedTrial, cutouts: List[Tuple[float, float]]) -> LoadedTrial:
+        if not cutouts:
+            return trial
+        t = np.asarray(trial.time, float)
+        sig = np.asarray(trial.signal_465, float).copy()
+        ref = np.asarray(trial.reference_405, float).copy()
+        for (a, b) in cutouts:
+            mask = (t >= float(a)) & (t <= float(b))
+            sig[mask] = np.nan
+            ref[mask] = np.nan
+        return LoadedTrial(
+            path=trial.path,
+            channel_id=trial.channel_id,
+            time=t,
+            signal_465=sig,
+            reference_405=ref,
+            sampling_rate=trial.sampling_rate,
+            trigger_time=trial.trigger_time,
+            trigger=trial.trigger,
+            trigger_name=trial.trigger_name,
+        )
+
+    def _apply_cutouts_to_processed(self, processed: ProcessedTrial, cutouts: List[Tuple[float, float]]) -> ProcessedTrial:
+        if not cutouts or processed.time is None:
+            return processed
+        t = np.asarray(processed.time, float)
+        mask = np.zeros_like(t, dtype=bool)
+        for (a, b) in cutouts:
+            mask |= (t >= float(a)) & (t <= float(b))
+        if not np.any(mask):
+            return processed
+
+        def _mask_arr(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            if arr is None:
+                return None
+            y = np.asarray(arr, float).copy()
+            if y.size == t.size:
+                y[mask] = np.nan
+            return y
+
+        raw_sig = _mask_arr(processed.raw_signal)
+        raw_ref = _mask_arr(processed.raw_reference)
+        processed.raw_signal = raw_sig if raw_sig is not None else processed.raw_signal
+        processed.raw_reference = raw_ref if raw_ref is not None else processed.raw_reference
+        processed.sig_f = _mask_arr(processed.sig_f)
+        processed.ref_f = _mask_arr(processed.ref_f)
+        processed.baseline_sig = _mask_arr(processed.baseline_sig)
+        processed.baseline_ref = _mask_arr(processed.baseline_ref)
+        processed.output = _mask_arr(processed.output)
+        return processed
+
+    def _slice_trial(self, trial: LoadedTrial, start_s: float, end_s: float) -> Optional[LoadedTrial]:
+        t = np.asarray(trial.time, float)
+        mask = (t >= float(start_s)) & (t <= float(end_s))
+        if np.sum(mask) < 2:
+            return None
+        time = t[mask]
+        sig = np.asarray(trial.signal_465, float)[mask]
+        ref = np.asarray(trial.reference_405, float)[mask]
+        trig_time = trial.trigger_time
+        trig = trial.trigger
+        if trig_time is not None and trig is not None:
+            if trig_time.size == t.size:
+                trig_time = np.asarray(trig_time, float)[mask]
+                trig = np.asarray(trig, float)[mask]
+            else:
+                tmask = (trig_time >= float(start_s)) & (trig_time <= float(end_s))
+                trig_time = np.asarray(trig_time, float)[tmask]
+                trig = np.asarray(trig, float)[tmask]
+        fs = 1.0 / float(np.nanmedian(np.diff(time))) if time.size > 2 else np.nan
+        return LoadedTrial(
+            path=trial.path,
+            channel_id=trial.channel_id,
+            time=time,
+            signal_465=sig,
+            reference_405=ref,
+            sampling_rate=float(fs) if np.isfinite(fs) else np.nan,
+            trigger_time=trig_time,
+            trigger=trig,
+            trigger_name=trial.trigger_name,
+        )
 
     def _update_raw_plot(self) -> None:
         if not self._current_path or not self._current_channel:
@@ -293,7 +460,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         trial = doric.make_trial(self._current_channel, trigger_name=self._current_trigger)
+        trial = self._apply_time_window(trial)
         key = (self._current_path, self._current_channel)
+        cutouts = self._cutout_regions_by_key.get(key, [])
+        trial = self._apply_cutouts(trial, cutouts)
         manual = self._manual_regions_by_key.get(key, [])
 
         self.plots.set_title(os.path.basename(self._current_path))
@@ -323,8 +493,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         params = self.param_panel.get_params()
         trial = doric.make_trial(self._current_channel, trigger_name=self._current_trigger)
-
+        trial = self._apply_time_window(trial)
         key = (self._current_path, self._current_channel)
+        cutouts = self._cutout_regions_by_key.get(key, [])
+        trial = self._apply_cutouts(trial, cutouts)
+
         manual = self._manual_regions_by_key.get(key, [])
         self._job_counter += 1
         job_id = self._job_counter
@@ -351,6 +524,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return  # ignore stale jobs
 
         key = (processed.path, processed.channel_id)
+        cutouts = self._cutout_regions_by_key.get(key, [])
+        processed = self._apply_cutouts_to_processed(processed, cutouts)
         self._last_processed[key] = processed
 
         # Update artifact panel regions list
@@ -443,34 +618,62 @@ class MainWindow(QtWidgets.QMainWindow):
 
         params = self.param_panel.get_params()
 
-        # Process/export each selected file, for each channel detected
-        # For speed, use pipeline (decimated) and reuse loaded files.
+        # Process/export each selected file, for the currently selected channel.
         n_total = 0
         for path in selected:
             doric = self._loaded_files.get(path)
             if not doric:
                 continue
-            for ch in doric.channels:
-                key = (path, ch)
-                trial = doric.make_trial(ch, trigger_name=self._current_trigger)  # export uses current trigger selection
-                manual = self._manual_regions_by_key.get(key, [])
-                meta = self._metadata_by_key.get(key, {})
+            ch = self._current_channel if (self._current_channel in doric.channels) else (doric.channels[0] if doric.channels else None)
+            if not ch:
+                continue
+            key = (path, ch)
+            trial = doric.make_trial(ch, trigger_name=self._current_trigger)  # export uses current trigger selection
+            trial = self._apply_time_window(trial)
+            cutouts = self._cutout_regions_by_key.get(key, [])
+            trial = self._apply_cutouts(trial, cutouts)
+            manual = self._manual_regions_by_key.get(key, [])
+            meta = self._metadata_by_key.get(key, {})
+            sections = self._sections_by_key.get(key, [])
 
-                try:
+            def _export_one(proc: ProcessedTrial, suffix: str = "") -> None:
+                nonlocal n_total
+                proc = self._apply_cutouts_to_processed(proc, cutouts)
+                stem = safe_stem_from_metadata(path, ch, meta)
+                if suffix:
+                    stem = f"{stem}_{suffix}"
+                csv_path = os.path.join(out_dir, f"{stem}.csv")
+                h5_path = os.path.join(out_dir, f"{stem}.h5")
+                export_processed_csv(csv_path, proc)
+                export_processed_h5(h5_path, proc, metadata=meta)
+                n_total += 1
+
+            try:
+                if sections:
+                    for i, sec in enumerate(sections, start=1):
+                        s0 = float(sec.get("start", 0.0))
+                        s1 = float(sec.get("end", 0.0))
+                        sec_trial = self._slice_trial(trial, s0, s1)
+                        if sec_trial is None:
+                            continue
+                        sec_params = ProcessingParams.from_dict(sec.get("params", {})) if isinstance(sec.get("params"), dict) else params
+                        processed = self.processor.process_trial(
+                            trial=sec_trial,
+                            params=sec_params,
+                            manual_regions_sec=manual,
+                            preview_mode=False,
+                        )
+                        _export_one(processed, suffix=f"sec{i}_{s0:.2f}_{s1:.2f}")
+                else:
                     processed = self.processor.process_trial(
                         trial=trial,
                         params=params,
                         manual_regions_sec=manual,
                         preview_mode=False,
                     )
-                    stem = safe_stem_from_metadata(path, ch, meta)
-                    csv_path = os.path.join(out_dir, f"{stem}.csv")
-                    h5_path = os.path.join(out_dir, f"{stem}.h5")
-                    export_processed_csv(csv_path, processed)
-                    export_processed_h5(h5_path, processed, metadata=meta)
-                    n_total += 1
-                except Exception as e:
-                    QtWidgets.QMessageBox.warning(self, "Export error", f"Failed export:\n{path} [{ch}]\n\n{e}")
+                    _export_one(processed)
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "Export error", f"Failed export:\n{path} [{ch}]\n\n{e}")
 
         self.plots.set_log(f"Export complete: {n_total} recording(s) written to {out_dir}")
 
@@ -490,8 +693,11 @@ class MainWindow(QtWidgets.QMainWindow):
             doric = self._loaded_files.get(p)
             if not doric:
                 continue
-            # Use current channel for that file if previewed; otherwise use AIN01
-            ch = self._current_channel if (p == self._current_path and self._current_channel) else (doric.channels[0] if doric.channels else "AIN01")
+            # Use current channel when available for all selected files
+            if self._current_channel and self._current_channel in doric.channels:
+                ch = self._current_channel
+            else:
+                ch = doric.channels[0] if doric.channels else "AIN01"
             key = (p, ch)
             if key in self._last_processed:
                 out.append(self._last_processed[key])
@@ -500,6 +706,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     params = self.param_panel.get_params()
                     trial = doric.make_trial(ch, trigger_name=self._current_trigger)
+                    trial = self._apply_time_window(trial)
                     manual = self._manual_regions_by_key.get(key, [])
                     proc = self.processor.process_trial(trial, params, manual_regions_sec=manual, preview_mode=False)
                     self._last_processed[key] = proc
@@ -531,33 +738,188 @@ class MainWindow(QtWidgets.QMainWindow):
 
         Fixes numpy array truth-value ambiguity by checking None/len explicitly.
         """
-        f = self._raw_cache.get(path, None)
+        f = self._loaded_files.get(path, None)
 
         if f is None:
-            return None, None
+            return
 
         # digital_time may be a numpy array
         if getattr(f, "digital_time", None) is None:
-            return None, None
+            return
 
         t_dio = np.asarray(f.digital_time)
         if t_dio.size == 0:
-            return None, None
+            return
 
         digital_map = getattr(f, "digital_by_name", None)
         if not isinstance(digital_map, dict) or dio_name not in digital_map:
-            return None, None
+            return
 
         y_dio = np.asarray(digital_map[dio_name])
         if y_dio.size == 0:
-            return None, None
+            return
 
         # Ensure same length
         n = min(t_dio.size, y_dio.size)
         t_dio = t_dio[:n]
         y_dio = y_dio[:n]
 
-        return t_dio, y_dio
+        self.post_tab.receive_dio_data(path, dio_name, t_dio, y_dio)
+        return
+
+    # ---------------- Drag and drop ----------------
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            paths = [u.toLocalFile() for u in event.mimeData().urls()]
+            if self._can_accept_drop(paths):
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def dropEvent(self, event) -> None:
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        paths = [u.toLocalFile() for u in event.mimeData().urls()]
+        self._handle_drop(paths)
+        event.acceptProposedAction()
+
+    def _can_accept_drop(self, paths: List[str]) -> bool:
+        known_ext = (".doric", ".h5", ".hdf5", ".csv")
+        return any(p.lower().endswith(known_ext) for p in paths)
+
+    def _handle_drop(self, paths: List[str]) -> None:
+        doric_paths: List[str] = []
+        processed: List[ProcessedTrial] = []
+
+        for p in paths:
+            if not p:
+                continue
+            ext = os.path.splitext(p)[1].lower()
+            if ext == ".doric":
+                doric_paths.append(p)
+                continue
+            if ext == ".csv":
+                trial = self._load_processed_csv(p)
+                if trial is not None:
+                    processed.append(trial)
+                continue
+            if ext in (".h5", ".hdf5"):
+                trial = self._load_processed_h5(p)
+                if trial is not None:
+                    processed.append(trial)
+                else:
+                    doric_paths.append(p)
+
+        if doric_paths:
+            self._add_files(doric_paths)
+        if processed:
+            self.post_tab.append_processed(processed)
+
+    def _load_processed_csv(self, path: str) -> Optional[ProcessedTrial]:
+        import csv
+        try:
+            with open(path, "r", newline="") as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+        except Exception:
+            return None
+        if not rows:
+            return None
+
+        header = [h.strip().lower() for h in rows[0]]
+        has_header = "time" in header and "output" in header
+        data_rows = rows[1:] if has_header else rows
+        time = []
+        output = []
+        dio = []
+        has_dio = has_header and "dio" in header
+
+        for r in data_rows:
+            if len(r) < 2:
+                continue
+            try:
+                tval = float(r[0])
+                oval = float(r[1])
+            except Exception:
+                continue
+            time.append(tval)
+            output.append(oval)
+            if has_dio and len(r) > 2:
+                try:
+                    dio.append(float(r[2]))
+                except Exception:
+                    dio.append(np.nan)
+
+        if not time:
+            return None
+
+        t = np.asarray(time, float)
+        out = np.asarray(output, float)
+        raw = np.full_like(t, np.nan, dtype=float)
+        dio_arr = np.asarray(dio, float) if has_dio and len(dio) == len(time) else None
+
+        return ProcessedTrial(
+            path=path,
+            channel_id="import",
+            time=t,
+            raw_signal=raw,
+            raw_reference=raw.copy(),
+            dio=dio_arr,
+            dio_name="",
+            sig_f=None,
+            ref_f=None,
+            baseline_sig=None,
+            baseline_ref=None,
+            output=out,
+            output_label="Imported CSV",
+            artifact_regions_sec=None,
+            fs_actual=np.nan,
+            fs_target=np.nan,
+            fs_used=np.nan,
+        )
+
+    def _load_processed_h5(self, path: str) -> Optional[ProcessedTrial]:
+        try:
+            with h5py.File(path, "r") as f:
+                if "data" not in f:
+                    return None
+                g = f["data"]
+                if "time" not in g or "output" not in g:
+                    return None
+                t = np.asarray(g["time"][()], float)
+                out = np.asarray(g["output"][()], float)
+                raw_sig = np.asarray(g["raw_465"][()], float) if "raw_465" in g else np.full_like(t, np.nan)
+                raw_ref = np.asarray(g["raw_405"][()], float) if "raw_405" in g else np.full_like(t, np.nan)
+                dio = np.asarray(g["dio"][()], float) if "dio" in g else None
+                dio_name = str(g.attrs.get("dio_name", "")) if hasattr(g, "attrs") else ""
+                output_label = str(g.attrs.get("output_label", "Imported H5")) if hasattr(g, "attrs") else "Imported H5"
+                fs_actual = float(g.attrs.get("fs_actual", np.nan)) if hasattr(g, "attrs") else np.nan
+                fs_target = float(g.attrs.get("fs_target", np.nan)) if hasattr(g, "attrs") else np.nan
+                fs_used = float(g.attrs.get("fs_used", np.nan)) if hasattr(g, "attrs") else np.nan
+        except Exception:
+            return None
+
+        return ProcessedTrial(
+            path=path,
+            channel_id="import",
+            time=t,
+            raw_signal=raw_sig,
+            raw_reference=raw_ref,
+            dio=dio,
+            dio_name=dio_name,
+            sig_f=None,
+            ref_f=None,
+            baseline_sig=None,
+            baseline_ref=None,
+            output=out,
+            output_label=output_label,
+            artifact_regions_sec=None,
+            fs_actual=fs_actual,
+            fs_target=fs_target,
+            fs_used=fs_used,
+        )
 
     def closeEvent(self, event):
         self._save_settings()

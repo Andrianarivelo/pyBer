@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import os
 
 import numpy as np
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets, QtGui
 import pyqtgraph as pg
 
 from analysis_core import ProcessingParams, ProcessedTrial, OUTPUT_MODES, BASELINE_METHODS
@@ -292,11 +292,13 @@ class FileQueuePanel(QtWidgets.QGroupBox):
 
     channelChanged = QtCore.Signal(str)
     triggerChanged = QtCore.Signal(str)
+    timeWindowChanged = QtCore.Signal()
 
     updatePreviewRequested = QtCore.Signal()
     metadataRequested = QtCore.Signal()
     exportRequested = QtCore.Signal()
     toggleArtifactsRequested = QtCore.Signal()
+    advancedOptionsRequested = QtCore.Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__("Data", parent)
@@ -330,8 +332,26 @@ class FileQueuePanel(QtWidgets.QGroupBox):
         self.combo_trigger.setMinimumWidth(220)
         self.combo_trigger.addItem("")
 
+        self.edit_time_start = QtWidgets.QLineEdit()
+        self.edit_time_end = QtWidgets.QLineEdit()
+        for ed in (self.edit_time_start, self.edit_time_end):
+            ed.setPlaceholderText("Start (s)" if ed is self.edit_time_start else "End (s)")
+            ed.setMinimumWidth(100)
+            ed.setValidator(QtGui.QDoubleValidator(0.0, 1e9, 3, ed))
+
+        time_row = QtWidgets.QHBoxLayout()
+        time_row.setSpacing(6)
+        time_row.addWidget(QtWidgets.QLabel("Start"))
+        time_row.addWidget(self.edit_time_start)
+        time_row.addWidget(QtWidgets.QLabel("End"))
+        time_row.addWidget(self.edit_time_end)
+        time_row.addStretch(1)
+        time_widget = QtWidgets.QWidget()
+        time_widget.setLayout(time_row)
+
         form.addRow("Channel (preview)", self.combo_channel)
         form.addRow("Digital trigger (overlay)", self.combo_trigger)
+        form.addRow("Time window (s)", time_widget)
 
         btnrow = QtWidgets.QGridLayout()
         btnrow.setHorizontalSpacing(8)
@@ -350,10 +370,14 @@ class FileQueuePanel(QtWidgets.QGroupBox):
         self.btn_update.setProperty("class", "compactPrimary")
         self.btn_export.setProperty("class", "compactPrimary")
 
+        self.btn_advanced = QtWidgets.QPushButton("Advanced options")
+        self.btn_advanced.setProperty("class", "compact")
+
         btnrow.addWidget(self.btn_metadata, 0, 0)
         btnrow.addWidget(self.btn_update,   0, 1)
         btnrow.addWidget(self.btn_artifacts, 1, 0)
         btnrow.addWidget(self.btn_export,    1, 1)
+        btnrow.addWidget(self.btn_advanced, 2, 0, 1, 2)
 
         self.lbl_hint = QtWidgets.QLabel("")
         self.lbl_hint.setProperty("class", "hint")
@@ -371,11 +395,14 @@ class FileQueuePanel(QtWidgets.QGroupBox):
 
         self.combo_channel.currentTextChanged.connect(self.channelChanged.emit)
         self.combo_trigger.currentTextChanged.connect(self.triggerChanged.emit)
+        self.edit_time_start.textChanged.connect(lambda *_: self.timeWindowChanged.emit())
+        self.edit_time_end.textChanged.connect(lambda *_: self.timeWindowChanged.emit())
 
         self.btn_update.clicked.connect(self.updatePreviewRequested.emit)
         self.btn_metadata.clicked.connect(self.metadataRequested.emit)
         self.btn_export.clicked.connect(self.exportRequested.emit)
         self.btn_artifacts.clicked.connect(self.toggleArtifactsRequested.emit)
+        self.btn_advanced.clicked.connect(self.advancedOptionsRequested.emit)
 
     def set_path_hint(self, text: str) -> None:
         self.lbl_hint.setText(text)
@@ -439,6 +466,224 @@ class FileQueuePanel(QtWidgets.QGroupBox):
         if idx >= 0:
             self.combo_trigger.setCurrentIndex(idx)
 
+    def time_window(self) -> Tuple[Optional[float], Optional[float]]:
+        def _parse(text: str) -> Optional[float]:
+            t = text.strip()
+            if not t:
+                return None
+            try:
+                return float(t)
+            except Exception:
+                return None
+
+        return _parse(self.edit_time_start.text()), _parse(self.edit_time_end.text())
+
+
+class SectionParamsDialog(QtWidgets.QDialog):
+    def __init__(self, params: ProcessingParams, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Section Parameters")
+        self.setModal(True)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.panel = ParameterPanel(self)
+        self.panel.set_params(params)
+        layout.addWidget(self.panel)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        btn_ok = QtWidgets.QPushButton("OK")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_ok.setDefault(True)
+        row.addWidget(btn_ok)
+        row.addWidget(btn_cancel)
+        layout.addLayout(row)
+
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+
+    def get_params(self) -> ProcessingParams:
+        return self.panel.get_params()
+
+
+class AdvancedOptionsDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        cutouts: List[Tuple[float, float]],
+        sections: List[Dict[str, object]],
+        base_params: ProcessingParams,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Advanced Options")
+        self.setModal(True)
+        self.resize(720, 520)
+        self._base_params = base_params
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Cutouts
+        grp_cut = QtWidgets.QGroupBox("Cut out regions (set to NaN, excluded from output)")
+        vcut = QtWidgets.QVBoxLayout(grp_cut)
+        self.table_cut = QtWidgets.QTableWidget(0, 2)
+        self.table_cut.setHorizontalHeaderLabels(["Start (s)", "End (s)"])
+        self.table_cut.horizontalHeader().setStretchLastSection(True)
+        self.table_cut.verticalHeader().setVisible(False)
+        self.table_cut.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_cut.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+
+        cut_btns = QtWidgets.QHBoxLayout()
+        self.btn_cut_add = QtWidgets.QPushButton("Add cut")
+        self.btn_cut_del = QtWidgets.QPushButton("Delete cut")
+        cut_btns.addWidget(self.btn_cut_add)
+        cut_btns.addWidget(self.btn_cut_del)
+        cut_btns.addStretch(1)
+
+        vcut.addWidget(self.table_cut)
+        vcut.addLayout(cut_btns)
+
+        # Sections
+        grp_sec = QtWidgets.QGroupBox("Sections (processed separately)")
+        vsec = QtWidgets.QVBoxLayout(grp_sec)
+        self.table_sec = QtWidgets.QTableWidget(0, 3)
+        self.table_sec.setHorizontalHeaderLabels(["Start (s)", "End (s)", "Params"])
+        self.table_sec.horizontalHeader().setStretchLastSection(True)
+        self.table_sec.verticalHeader().setVisible(False)
+        self.table_sec.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_sec.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+
+        sec_btns = QtWidgets.QHBoxLayout()
+        self.btn_sec_add = QtWidgets.QPushButton("Add section")
+        self.btn_sec_del = QtWidgets.QPushButton("Delete section")
+        self.btn_sec_params = QtWidgets.QPushButton("Edit params")
+        sec_btns.addWidget(self.btn_sec_add)
+        sec_btns.addWidget(self.btn_sec_del)
+        sec_btns.addWidget(self.btn_sec_params)
+        sec_btns.addStretch(1)
+
+        vsec.addWidget(self.table_sec)
+        vsec.addLayout(sec_btns)
+
+        layout.addWidget(grp_cut)
+        layout.addWidget(grp_sec)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        btn_ok = QtWidgets.QPushButton("OK")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_ok.setDefault(True)
+        row.addWidget(btn_ok)
+        row.addWidget(btn_cancel)
+        layout.addLayout(row)
+
+        self.btn_cut_add.clicked.connect(self._add_cut)
+        self.btn_cut_del.clicked.connect(self._del_cut)
+        self.btn_sec_add.clicked.connect(self._add_section)
+        self.btn_sec_del.clicked.connect(self._del_section)
+        self.btn_sec_params.clicked.connect(self._edit_section_params)
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+
+        self._load_cutouts(cutouts)
+        self._load_sections(sections)
+
+    def _load_cutouts(self, cutouts: List[Tuple[float, float]]) -> None:
+        self.table_cut.setRowCount(0)
+        for (a, b) in cutouts or []:
+            r = self.table_cut.rowCount()
+            self.table_cut.insertRow(r)
+            self.table_cut.setItem(r, 0, QtWidgets.QTableWidgetItem(f"{float(a):.3f}"))
+            self.table_cut.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{float(b):.3f}"))
+
+    def _load_sections(self, sections: List[Dict[str, object]]) -> None:
+        self.table_sec.setRowCount(0)
+        for sec in sections or []:
+            r = self.table_sec.rowCount()
+            self.table_sec.insertRow(r)
+            start = float(sec.get("start", 0.0))
+            end = float(sec.get("end", 0.0))
+            params = sec.get("params")
+            self._set_section_row(r, start, end, params)
+
+    def _set_section_row(self, row: int, start: float, end: float, params: Optional[Dict[str, object]]) -> None:
+        self.table_sec.setItem(row, 0, QtWidgets.QTableWidgetItem(f"{float(start):.3f}"))
+        self.table_sec.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{float(end):.3f}"))
+        p = ProcessingParams.from_dict(params) if isinstance(params, dict) else self._base_params
+        summary = f"{p.output_mode} | {p.baseline_method}"
+        item = QtWidgets.QTableWidgetItem(summary)
+        item.setData(QtCore.Qt.ItemDataRole.UserRole, p.to_dict())
+        self.table_sec.setItem(row, 2, item)
+
+    def _add_cut(self) -> None:
+        r = self.table_cut.rowCount()
+        self.table_cut.insertRow(r)
+        self.table_cut.setItem(r, 0, QtWidgets.QTableWidgetItem(""))
+        self.table_cut.setItem(r, 1, QtWidgets.QTableWidgetItem(""))
+
+    def _del_cut(self) -> None:
+        rows = self.table_cut.selectionModel().selectedRows()
+        if rows:
+            self.table_cut.removeRow(rows[0].row())
+
+    def _add_section(self) -> None:
+        r = self.table_sec.rowCount()
+        self.table_sec.insertRow(r)
+        self._set_section_row(r, 0.0, 0.0, self._base_params.to_dict())
+
+    def _del_section(self) -> None:
+        rows = self.table_sec.selectionModel().selectedRows()
+        if rows:
+            self.table_sec.removeRow(rows[0].row())
+
+    def _edit_section_params(self) -> None:
+        rows = self.table_sec.selectionModel().selectedRows()
+        if not rows:
+            return
+        r = rows[0].row()
+        item = self.table_sec.item(r, 2)
+        params_dict = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
+        params = ProcessingParams.from_dict(params_dict) if isinstance(params_dict, dict) else self._base_params
+        dlg = SectionParamsDialog(params, self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        new_params = dlg.get_params()
+        self._set_section_row(
+            r,
+            float(self._read_float(self.table_sec.item(r, 0))),
+            float(self._read_float(self.table_sec.item(r, 1))),
+            new_params.to_dict(),
+        )
+
+    @staticmethod
+    def _read_float(item: Optional[QtWidgets.QTableWidgetItem]) -> float:
+        if item is None:
+            return 0.0
+        try:
+            return float(item.text().strip())
+        except Exception:
+            return 0.0
+
+    def get_cutouts(self) -> List[Tuple[float, float]]:
+        out: List[Tuple[float, float]] = []
+        for r in range(self.table_cut.rowCount()):
+            a = self._read_float(self.table_cut.item(r, 0))
+            b = self._read_float(self.table_cut.item(r, 1))
+            if b <= a:
+                continue
+            out.append((a, b))
+        return out
+
+    def get_sections(self) -> List[Dict[str, object]]:
+        out: List[Dict[str, object]] = []
+        for r in range(self.table_sec.rowCount()):
+            a = self._read_float(self.table_sec.item(r, 0))
+            b = self._read_float(self.table_sec.item(r, 1))
+            if b <= a:
+                continue
+            item = self.table_sec.item(r, 2)
+            params_dict = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
+            out.append({"start": a, "end": b, "params": params_dict})
+        return out
+
 
 # ----------------------------- Parameter panel -----------------------------
 
@@ -447,8 +692,102 @@ class ParameterPanel(QtWidgets.QGroupBox):
 
     def __init__(self, parent=None) -> None:
         super().__init__("Processing Parameters", parent)
+        self._help_texts = self._build_help_texts()
         self._build_ui()
         self._wire()
+
+    def _build_help_texts(self) -> Dict[str, str]:
+        return {
+            "artifact_mode": (
+                "Artifact detection mode uses the 465 signal derivative (dx).\n"
+                "- Global MAD: single threshold for the full trace (fast, stable).\n"
+                "- Adaptive MAD: threshold computed in sliding windows (handles drift)."
+            ),
+            "mad_k": (
+                "MAD threshold (k) scales the derivative threshold.\n"
+                "Higher k = fewer artifacts flagged; lower k = more sensitive."
+            ),
+            "adaptive_window_s": (
+                "Adaptive window length in seconds for windowed MAD.\n"
+                "Shorter windows follow local noise; longer windows are smoother."
+            ),
+            "artifact_pad_s": (
+                "Pad (seconds) added around detected artifacts.\n"
+                "Larger pad masks more surrounding points."
+            ),
+            "lowpass_hz": (
+                "Low-pass cutoff (Hz) applied before decimation.\n"
+                "Lower cutoff removes more high-frequency noise but can blur fast events."
+            ),
+            "filter_order": (
+                "Butterworth filter order. Higher order = sharper cutoff but more ringing risk."
+            ),
+            "target_fs_hz": (
+                "Target sampling rate (Hz) for decimation.\n"
+                "Lower values speed processing and plotting but reduce time resolution."
+            ),
+            "baseline_method": (
+                "Baseline method (pybaselines):\n"
+                "- asls: asymmetric least squares; uses p to favor baseline below peaks.\n"
+                "- arpls: asymmetrically reweighted penalized least squares; robust to peaks.\n"
+                "- airpls: adaptive iteratively reweighted penalized least squares; good for drift.\n"
+                "Method choice affects how aggressively the baseline follows slow trends."
+            ),
+            "baseline_lambda": (
+                "Baseline lambda (x e y) is the smoothness penalty.\n"
+                "Larger values = smoother baseline; smaller values = more flexible baseline."
+            ),
+            "baseline_diff_order": (
+                "Baseline diff_order sets the derivative order for smoothness (usually 2).\n"
+                "Higher order enforces smoother curvature."
+            ),
+            "baseline_max_iter": (
+                "Baseline max_iter limits the iterative solver iterations.\n"
+                "Higher values may improve convergence but take longer."
+            ),
+            "baseline_tol": (
+                "Baseline tol controls convergence tolerance.\n"
+                "Smaller values are stricter but may require more iterations."
+            ),
+            "asls_p": (
+                "AsLS p controls asymmetry (only used for asls).\n"
+                "Smaller p keeps baseline below peaks more aggressively."
+            ),
+            "output_mode": (
+                "Output mode selects dFF/z-score and motion correction strategy.\n"
+                "Options include non-corrected, subtraction-based, and fitted-reference modes."
+            ),
+            "reference_fit": (
+                "Reference fit method for fitted-reference outputs:\n"
+                "- OLS: standard linear fit (recommended).\n"
+                "- Lasso: sparse linear fit (uses alpha).\n"
+                "Affects how the 405 reference is fit to the 465 signal."
+            ),
+            "lasso_alpha": (
+                "Lasso alpha controls regularization strength (only for Lasso).\n"
+                "Higher alpha = stronger shrinkage; lower alpha = closer to OLS."
+            ),
+        }
+
+    def _show_help(self, key: str, title: str) -> None:
+        text = self._help_texts.get(key, "No help available for this setting.")
+        QtWidgets.QMessageBox.information(self, title, text)
+
+    def _label_with_help(self, text: str, key: str) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        lbl = QtWidgets.QLabel(text)
+        btn = QtWidgets.QPushButton("?")
+        btn.setProperty("class", "help")
+        btn.setFixedSize(22, 22)
+        btn.setToolTip("Explain this setting")
+        btn.clicked.connect(lambda *_: self._show_help(key, text))
+        h.addWidget(lbl)
+        h.addStretch(1)
+        h.addWidget(btn)
+        return w
 
     def _build_ui(self) -> None:
         form = QtWidgets.QFormLayout(self)
@@ -548,27 +887,27 @@ class ParameterPanel(QtWidgets.QGroupBox):
         self.spin_lasso.setRange(1e-6, 1.0)
         self.spin_lasso.setValue(1e-3)
 
-        self.lbl_fs = QtWidgets.QLabel("FS: —")
+        self.lbl_fs = QtWidgets.QLabel("FS: -")
         self.lbl_fs.setProperty("class", "hint")
 
-        form.addRow("Artifact detection", self.combo_artifact)
-        form.addRow("MAD threshold (k)", self.spin_mad)
-        form.addRow("Adaptive window (s)", self.spin_adapt_win)
-        form.addRow("Artifact pad (s)", self.spin_pad)
-        form.addRow("Low-pass cutoff (Hz)", self.spin_lowpass)
-        form.addRow("Filter order", self.spin_filt_order)
-        form.addRow("Target FS (Hz)", self.spin_target_fs)
+        form.addRow(self._label_with_help("Artifact detection", "artifact_mode"), self.combo_artifact)
+        form.addRow(self._label_with_help("MAD threshold (k)", "mad_k"), self.spin_mad)
+        form.addRow(self._label_with_help("Adaptive window (s)", "adaptive_window_s"), self.spin_adapt_win)
+        form.addRow(self._label_with_help("Artifact pad (s)", "artifact_pad_s"), self.spin_pad)
+        form.addRow(self._label_with_help("Low-pass cutoff (Hz)", "lowpass_hz"), self.spin_lowpass)
+        form.addRow(self._label_with_help("Filter order", "filter_order"), self.spin_filt_order)
+        form.addRow(self._label_with_help("Target FS (Hz)", "target_fs_hz"), self.spin_target_fs)
 
-        form.addRow("Baseline method", self.combo_baseline)
-        form.addRow("Baseline γ / λ (x e y)", lam_widget)
-        form.addRow("diff_order", self.spin_diff)
-        form.addRow("max_iter", self.spin_iter)
-        form.addRow("tol", self.spin_tol)
-        form.addRow("AsLS p", self.spin_asls_p)
+        form.addRow(self._label_with_help("Baseline method", "baseline_method"), self.combo_baseline)
+        form.addRow(self._label_with_help("Baseline I3 / I? (x e y)", "baseline_lambda"), lam_widget)
+        form.addRow(self._label_with_help("diff_order", "baseline_diff_order"), self.spin_diff)
+        form.addRow(self._label_with_help("max_iter", "baseline_max_iter"), self.spin_iter)
+        form.addRow(self._label_with_help("tol", "baseline_tol"), self.spin_tol)
+        form.addRow(self._label_with_help("AsLS p", "asls_p"), self.spin_asls_p)
 
-        form.addRow("Output mode", self.combo_output)
-        form.addRow("Ref fit (z-reg only)", self.combo_ref_fit)
-        form.addRow("Lasso α", self.spin_lasso)
+        form.addRow(self._label_with_help("Output mode", "output_mode"), self.combo_output)
+        form.addRow(self._label_with_help("Ref fit (z-reg only)", "reference_fit"), self.combo_ref_fit)
+        form.addRow(self._label_with_help("Lasso I?", "lasso_alpha"), self.spin_lasso)
         form.addRow("", self.lbl_fs)
 
         self._update_lambda_preview()
@@ -637,6 +976,36 @@ class ParameterPanel(QtWidgets.QGroupBox):
             reference_fit=self.combo_ref_fit.currentText(),
             lasso_alpha=float(self.spin_lasso.value()),
         )
+
+    def set_params(self, params: ProcessingParams) -> None:
+        if not params:
+            return
+        self.combo_artifact.setCurrentText(str(params.artifact_mode))
+        self.spin_mad.setValue(float(params.mad_k))
+        self.spin_adapt_win.setValue(float(params.adaptive_window_s))
+        self.spin_pad.setValue(float(params.artifact_pad_s))
+        self.spin_lowpass.setValue(float(params.lowpass_hz))
+        self.spin_filt_order.setValue(int(params.filter_order))
+        self.spin_target_fs.setValue(float(params.target_fs_hz))
+
+        self.combo_baseline.setCurrentText(str(params.baseline_method))
+        lam = float(params.baseline_lambda)
+        if lam > 0:
+            import math
+            y = int(math.floor(math.log10(lam)))
+            x = lam / (10.0 ** y)
+            self.spin_lam_x.setValue(float(x))
+            self.spin_lam_y.setValue(int(y))
+        self.spin_diff.setValue(int(params.baseline_diff_order))
+        self.spin_iter.setValue(int(params.baseline_max_iter))
+        self.spin_tol.setValue(float(params.baseline_tol))
+        self.spin_asls_p.setValue(float(params.asls_p))
+
+        self.combo_output.setCurrentText(str(params.output_mode))
+        self.combo_ref_fit.setCurrentText(str(params.reference_fit))
+        self.spin_lasso.setValue(float(params.lasso_alpha))
+
+        self._update_lambda_preview()
 
     def set_fs_info(self, fs_actual: float, fs_target: float, fs_used: float) -> None:
         self.lbl_fs.setText(f"FS: actual={fs_actual:.2f} Hz → used={fs_used:.2f} Hz (target={fs_target:.2f})")
