@@ -6,7 +6,7 @@ QWidget {
     background: #0f141b;
     color: #e6eefc;
     font-family: Segoe UI, Arial, sans-serif;
-    font-size: 10.5pt;
+    font-size: 9.5pt;
 }
 
 QGroupBox {
@@ -80,12 +80,33 @@ QPushButton[class="compact"] {
     border-radius: 9px;
     font-weight: 600;
 }
+QPushButton[class="compactSmall"] {
+    padding: 2px 6px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 8.0pt;
+    min-height: 18px;
+}
 QPushButton[class="compactPrimary"] {
     padding: 6px 10px;
     border-radius: 9px;
     font-weight: 800;
     background: #254a7a;
     border: 1px solid #2f6bb3;
+}
+QPushButton[class="compactPrimarySmall"] {
+    padding: 2px 6px;
+    border-radius: 8px;
+    font-weight: 800;
+    font-size: 8.0pt;
+    background: #254a7a;
+    border: 1px solid #2f6bb3;
+}
+QPushButton[class="compactPrimarySmall"]::text {
+    text-align: left;
+}
+QPushButton[class="compactPrimarySmall"]:hover {
+    background: #2b5a96;
 }
 QPushButton[class="compactPrimary"]:hover {
     background: #2b5a96;
@@ -143,6 +164,6 @@ QDockWidget::title {
 /* Hints/log */
 QLabel[class="hint"] {
     color: #aab4c4;
-    font-size: 9.5pt;
+    font-size: 9.0pt;
 }
 """

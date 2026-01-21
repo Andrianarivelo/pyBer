@@ -235,7 +235,11 @@ def safe_stem_from_metadata(path: str, channel: str, meta: Dict[str, str]) -> st
     return f"{clean(base)}_{clean(channel)}"
 
 
-def export_processed_csv(path: str, processed: ProcessedTrial) -> None:
+def export_processed_csv(
+    path: str,
+    processed: ProcessedTrial,
+    metadata: Optional[Dict[str, str]] = None,
+) -> None:
     import csv
 
     t = np.asarray(processed.time, float)
@@ -250,6 +254,9 @@ def export_processed_csv(path: str, processed: ProcessedTrial) -> None:
 
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
+        if metadata:
+            for k, v in metadata.items():
+                w.writerow([f"# {k}: {v}"])
         if dio is None:
             w.writerow(["time", "output"])
             for i in range(t.size):

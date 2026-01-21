@@ -28,16 +28,169 @@ from analysis_core import (
     export_processed_csv,
     export_processed_h5,
     safe_stem_from_metadata,
+    detect_artifacts_adaptive,
+    interpolate_nans,
+    zscore_median_std,
+    safe_divide,
+    _lowpass_sos,
 )
 from gui_preprocessing import FileQueuePanel, ParameterPanel, PlotDashboard, MetadataDialog, ArtifactPanel, AdvancedOptionsDialog
 from gui_postprocessing import PostProcessingPanel
 from styles import APP_QSS
 import numpy as np
 
+def _rolling_corr(x: np.ndarray, y: np.ndarray, win: int) -> Tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    if win <= 10 or x.size < win or y.size < win:
+        return np.array([], float), np.array([], int)
+    step = max(10, win // 2)
+    rs = []
+    centers = []
+    for i in range(0, x.size - win + 1, step):
+        xx = x[i:i + win]
+        yy = y[i:i + win]
+        m = np.isfinite(xx) & np.isfinite(yy)
+        if np.sum(m) < 10:
+            r = np.nan
+        else:
+            r = float(np.corrcoef(xx[m], yy[m])[0, 1])
+        rs.append(r)
+        centers.append(i + win // 2)
+    return np.asarray(rs, float), np.asarray(centers, int)
+
+
+class QcDialog(QtWidgets.QDialog):
+    def __init__(self, qc: Dict[str, object], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Quality Check (z-score)")
+        self.resize(1100, 800)
+        self._qc = qc
+        layout = QtWidgets.QVBoxLayout(self)
+
+        self.plot_z = pg.PlotWidget(title="z_sig / z_ref")
+        self.plot_corr = pg.PlotWidget(title="Correlation (z_ref vs z_sig)")
+        self.plot_zdist = pg.PlotWidget(title="Z distribution")
+        self.plot_roll = pg.PlotWidget(title="Rolling corr(z_ref, z_sig)")
+        for w in (self.plot_z, self.plot_corr, self.plot_zdist, self.plot_roll):
+            w.showGrid(x=True, y=True, alpha=0.25)
+            w.showAxis("top", False)
+            w.showAxis("right", False)
+
+        self.plot_z.plot(qc["t"], qc["z_sig"], pen=pg.mkPen((90, 190, 255), width=1.0), name="z_sig")
+        self.plot_z.plot(qc["t"], qc["z_ref"], pen=pg.mkPen((240, 180, 80), width=1.0), name="z_ref")
+        self.plot_z.setLabel("left", "z units")
+
+        # Z distribution
+        Zf = qc["Zf"]
+        if Zf.size:
+            hist, edges = np.histogram(Zf, bins=80)
+            bg = pg.BarGraphItem(x=edges[:-1], height=hist, width=np.diff(edges), brush=pg.mkBrush(90, 143, 214, 80))
+            self.plot_zdist.addItem(bg)
+            q25 = float(qc.get("q25", np.nan))
+            q50 = float(qc.get("q50", np.nan))
+            q75 = float(qc.get("q75", np.nan))
+            if np.isfinite(q25) and np.isfinite(q75):
+                region = pg.LinearRegionItem(values=(q25, q75), brush=(90, 143, 214, 50), movable=False)
+                self.plot_zdist.addItem(region)
+            if np.isfinite(q50):
+                self.plot_zdist.addItem(pg.InfiniteLine(pos=q50, angle=90, pen=pg.mkPen((220, 220, 220), width=1.0)))
+            iqr = float(qc.get("iqr", np.nan))
+            if np.isfinite(q50) and np.isfinite(iqr):
+                self._add_plot_text_topleft(self.plot_zdist, f"median={q50:.3g}  IQR={iqr:.3g}")
+        self.plot_zdist.setLabel("left", "count")
+
+        # Correlation scatter + fit
+        z_ref = qc["z_ref"]
+        z_sig = qc["z_sig"]
+        m = np.isfinite(z_ref) & np.isfinite(z_sig)
+        if np.sum(m) >= 10:
+            self.plot_corr.plot(z_ref[m], z_sig[m], pen=None, symbol="o", symbolSize=4, symbolBrush=(120, 180, 220, 80))
+            a, b = np.polyfit(z_ref[m], z_sig[m], 1)
+            xs = np.linspace(np.nanmin(z_ref[m]), np.nanmax(z_ref[m]), 200)
+            self.plot_corr.plot(xs, a * xs + b, pen=pg.mkPen((220, 120, 120), width=1.2))
+            r = float(qc.get("r", np.nan))
+            r2 = r * r if np.isfinite(r) else np.nan
+            if np.isfinite(r):
+                self._add_plot_text_topleft(self.plot_corr, f"r={r:.3g}  r2={r2:.3g}")
+        self.plot_corr.setLabel("left", "z_sig")
+        self.plot_corr.setLabel("bottom", "z_ref")
+
+        # Rolling corr
+        if qc["r_roll"].size:
+            t_cent = qc["t"][qc["r_centers"]]
+            self.plot_roll.plot(t_cent, qc["r_roll"], pen=pg.mkPen((180, 200, 120), width=1.0))
+            self.plot_roll.addItem(pg.InfiniteLine(pos=0.5, angle=0, pen=pg.mkPen((200, 200, 200), width=1.0, style=QtCore.Qt.PenStyle.DashLine)))
+            r_avg = float(np.nanmean(qc["r_roll"])) if qc["r_roll"].size else np.nan
+            if np.isfinite(r_avg):
+                self._add_plot_text_topleft(self.plot_roll, f"avg r={r_avg:.3g}")
+        self.plot_roll.setLabel("left", "r")
+
+        stats = qc["stats"]
+        self.lbl_stats = QtWidgets.QLabel(stats)
+        self.lbl_stats.setProperty("class", "hint")
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        self.btn_save = QtWidgets.QPushButton("Save report images")
+        self.btn_close = QtWidgets.QPushButton("Close")
+        btn_row.addWidget(self.btn_save)
+        btn_row.addWidget(self.btn_close)
+
+        layout.addWidget(self.plot_z, stretch=2)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.plot_corr, stretch=1)
+        row.addWidget(self.plot_zdist, stretch=1)
+        layout.addLayout(row, stretch=2)
+        layout.addWidget(self.plot_roll, stretch=1)
+        layout.addWidget(self.lbl_stats)
+        layout.addLayout(btn_row)
+
+        self.btn_close.clicked.connect(self.close)
+        self.btn_save.clicked.connect(self._save_images)
+
+    def _add_plot_text_topleft(self, plot: pg.PlotWidget, text: str) -> None:
+        if not text:
+            return
+        vb = plot.getViewBox()
+        if not vb:
+            return
+        (x0, x1), (y0, y1) = vb.viewRange()
+        if not np.isfinite(x0) or not np.isfinite(y1):
+            return
+        pad_x = (x1 - x0) * 0.02
+        pad_y = (y1 - y0) * 0.05
+        item = pg.TextItem(text, color=(220, 220, 220), anchor=(0, 1))
+        item.setPos(x0 + pad_x, y1 - pad_y)
+        plot.addItem(item)
+
+    def _save_images(self) -> None:
+        self.save_report()
+
+    def save_report(self, out_dir: Optional[str] = None) -> None:
+        path = self._qc.get("path", "")
+        channel = self._qc.get("channel", "")
+        stem = os.path.splitext(os.path.basename(path))[0] if path else "quality"
+        if channel:
+            stem = f"{stem}_{channel}"
+        out_dir = out_dir or (os.path.dirname(path) if path else os.getcwd())
+        img_path = os.path.join(out_dir, f"{stem}_quality.png")
+        txt_path = os.path.join(out_dir, f"{stem}_quality.txt")
+        try:
+            pix = self.grab()
+            pix.save(img_path)
+        except Exception:
+            pass
+        try:
+            with open(txt_path, "w") as f:
+                f.write(str(self._qc.get("stats", "")))
+        except Exception:
+            pass
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Fiber Photometry Processor (Doric .doric) — PySide6")
+        self.setWindowTitle("Pyber - Fiber Photometry")
         self.resize(1500, 900)
 
         # Core
@@ -107,6 +260,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidgetResizable(True)
+        left_scroll.setMinimumWidth(160)
+        left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        left_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         left_scroll.setWidget(left_container)
 
         # Make panels resizable: left | plots (right dock already resizable by Qt)
@@ -115,7 +271,10 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.addWidget(self.plots)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([420, 1080])
+        # Set initial sizes: smaller left panel, larger visualization
+        splitter.setSizes([160, 1540])  # Narrower left panel to favor plots
+        # Connect splitter size changes to save settings
+        splitter.splitterMoved.connect(self._save_splitter_sizes)
 
         pre_layout = QtWidgets.QVBoxLayout(pre)
         pre_layout.setContentsMargins(10, 10, 10, 10)
@@ -138,6 +297,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.file_panel.exportRequested.connect(self._export_selected_or_all)
         self.file_panel.toggleArtifactsRequested.connect(self._toggle_artifacts_panel)
         self.file_panel.advancedOptionsRequested.connect(self._open_advanced_options)
+        self.file_panel.qcRequested.connect(self._run_qc_dialog)
+        self.file_panel.batchQcRequested.connect(self._run_batch_qc)
 
         # Parameters -> debounce preview
         self.param_panel.paramsChanged.connect(self._trigger_preview)
@@ -147,6 +308,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Manual artifacts
         self.plots.manualRegionFromSelectorRequested.connect(self._add_manual_region_from_selector)
+        self.plots.manualRegionFromDragRequested.connect(self._add_manual_region_from_drag)
         self.plots.clearManualRegionsRequested.connect(self._clear_manual_regions_current)
         self.plots.showArtifactsRequested.connect(self._toggle_artifacts_panel)
 
@@ -176,6 +338,19 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        # restore splitter sizes
+        try:
+            splitter_sizes = self.settings.value("splitter_sizes", None)
+            if splitter_sizes and hasattr(splitter_sizes, '__len__') and len(splitter_sizes) >= 2:
+                # Find the splitter in the preprocessing tab
+                pre_tab = self.tabs.widget(0)  # Assuming preprocessing is tab 0
+                if pre_tab:
+                    splitter = pre_tab.findChild(QtWidgets.QSplitter)
+                    if splitter:
+                        splitter.setSizes([int(splitter_sizes[0]), int(splitter_sizes[1])])
+        except Exception:
+            pass
+
     def _save_settings(self) -> None:
         try:
             last_dir = self.file_panel.current_dir_hint()
@@ -190,13 +365,26 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _save_splitter_sizes(self) -> None:
+        """Save the current splitter sizes to settings."""
+        try:
+            # Find the splitter in the preprocessing tab
+            pre_tab = self.tabs.widget(0)  # Assuming preprocessing is tab 0
+            if pre_tab:
+                splitter = pre_tab.findChild(QtWidgets.QSplitter)
+                if splitter:
+                    sizes = splitter.sizes()
+                    self.settings.setValue("splitter_sizes", sizes)
+        except Exception:
+            pass
+
     # ---------------- File loading ----------------
 
     def _open_files_dialog(self) -> None:
         start_dir = self.file_panel.current_dir_hint() or self.settings.value("last_open_dir", "", type=str) or os.getcwd()
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
-            "Open Doric .doric files",
+            "Open files",
             start_dir,
             "Doric files (*.doric *.h5 *.hdf5);;All files (*.*)",
         )
@@ -309,6 +497,128 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_processed.clear()
         self._update_raw_plot()
         self._trigger_preview()
+
+    def _run_qc_dialog(self) -> None:
+        if not self._current_path or not self._current_channel:
+            return
+        doric = self._loaded_files.get(self._current_path)
+        if not doric:
+            return
+        trial = doric.make_trial(self._current_channel, trigger_name=self._current_trigger)
+        trial = self._apply_time_window(trial)
+        key = (self._current_path, self._current_channel)
+        cutouts = self._cutout_regions_by_key.get(key, [])
+        trial = self._apply_cutouts(trial, cutouts)
+
+        qc = self._compute_qc(trial)
+        if qc is None:
+            return
+        dlg = QcDialog(qc, self)
+        dlg.exec()
+
+    def _run_batch_qc(self) -> None:
+        paths = self._selected_paths()
+        if not paths:
+            return
+        for p in paths:
+            doric = self._loaded_files.get(p)
+            if not doric:
+                continue
+            if self._current_channel and self._current_channel in doric.channels:
+                ch = self._current_channel
+            else:
+                ch = doric.channels[0] if doric.channels else None
+            if not ch:
+                continue
+            trial = doric.make_trial(ch, trigger_name=self._current_trigger)
+            trial = self._apply_time_window(trial)
+            key = (p, ch)
+            cutouts = self._cutout_regions_by_key.get(key, [])
+            trial = self._apply_cutouts(trial, cutouts)
+            qc = self._compute_qc(trial)
+            if qc is None:
+                continue
+            dlg = QcDialog(qc, self)
+            dlg.save_report()
+            dlg.close()
+
+    def _compute_qc(self, trial: LoadedTrial) -> Optional[Dict[str, object]]:
+        t = np.asarray(trial.time, float)
+        sig = np.asarray(trial.signal_465, float)
+        ref = np.asarray(trial.reference_405, float)
+        if t.size < 10:
+            return None
+        fs = float(trial.sampling_rate) if np.isfinite(trial.sampling_rate) else (
+            1.0 / float(np.nanmedian(np.diff(t))) if t.size > 2 else np.nan
+        )
+        m = np.isfinite(t) & np.isfinite(sig) & np.isfinite(ref)
+        t = t[m]; sig = sig[m]; ref = ref[m]
+        if t.size < 10:
+            return None
+
+        # Artifact removal (adaptive MAD)
+        mask_sig = detect_artifacts_adaptive(t, sig, k=6.0, window_s=1.0, pad_s=0.2)
+        mask_ref = detect_artifacts_adaptive(t, ref, k=6.0, window_s=1.0, pad_s=0.2)
+        mask = mask_sig | mask_ref
+        sig_clean = sig.copy()
+        ref_clean = ref.copy()
+        sig_clean[mask] = np.nan
+        ref_clean[mask] = np.nan
+        sig_clean = interpolate_nans(sig_clean)
+        ref_clean = interpolate_nans(ref_clean)
+        art_frac = float(np.mean(mask)) if mask.size else 0.0
+
+        # Baseline + dff
+        cutoff = 0.01
+        sig_base = _lowpass_sos(sig_clean, fs, cutoff, 3)
+        ref_base = _lowpass_sos(ref_clean, fs, cutoff, 3)
+        dff_sig = safe_divide(sig_clean - sig_base, sig_base)
+        dff_ref = safe_divide(ref_clean - ref_base, ref_base)
+
+        # z-score
+        z_sig = zscore_median_std(dff_sig)
+        z_ref = zscore_median_std(dff_ref)
+        Z = z_sig - z_ref
+        Zf = Z[np.isfinite(Z)]
+
+        # Correlation
+        m2 = np.isfinite(z_sig) & np.isfinite(z_ref)
+        r = float(np.corrcoef(z_ref[m2], z_sig[m2])[0, 1]) if np.sum(m2) >= 10 else np.nan
+        win = int(max(10, round(fs * 10.0))) if np.isfinite(fs) and fs > 0 else 5000
+        r_roll, centers = _rolling_corr(z_ref, z_sig, win)
+
+        # Distribution stats
+        if Zf.size:
+            q25, q50, q75 = np.quantile(Zf, [0.25, 0.5, 0.75])
+            frac_gt3 = float(np.mean(np.abs(Zf) > 3.0) * 100.0)
+            frac_gt5 = float(np.mean(np.abs(Zf) > 5.0) * 100.0)
+            iqr = float(q75 - q25)
+        else:
+            q25 = q50 = q75 = frac_gt3 = frac_gt5 = iqr = np.nan
+
+        stats = (
+            f"artifact_frac={art_frac*100:.2f}% | r={r:.3f} | "
+            f"Z median={q50:.3g} IQR=({q25:.3g},{q75:.3g}) | "
+            f"|Z|>3: {frac_gt3:.2f}% | |Z|>5: {frac_gt5:.2f}%"
+        )
+
+        return {
+            "path": trial.path,
+            "channel": trial.channel_id,
+            "t": t,
+            "z_sig": z_sig,
+            "z_ref": z_ref,
+            "Z": Z,
+            "Zf": Zf,
+            "r_roll": r_roll,
+            "r_centers": centers,
+            "r": r,
+            "q25": q25,
+            "q50": q50,
+            "q75": q75,
+            "iqr": iqr,
+            "stats": stats,
+        }
 
     # ---------------- Raw plot update ----------------
 
@@ -532,8 +842,26 @@ class MainWindow(QtWidgets.QMainWindow):
         regs = processed.artifact_regions_sec or []
         self.artifact_panel.set_regions(regs)
 
+        # Preserve current x/y ranges before updating plots
+        current_xrange = None
+        try:
+            # Get current x range from the first plot
+            view_box = self.plots.plot_raw.getViewBox()
+            if view_box:
+                x_range = view_box.viewRange()[0]  # x axis range
+                current_xrange = (x_range[0], x_range[1])
+        except Exception:
+            pass
+
         # Update plots (decimated signals)
         self.plots.update_plots(processed)
+
+        # Restore x range if it was preserved
+        if current_xrange is not None:
+            try:
+                self.plots.set_xrange_all(current_xrange[0], current_xrange[1])
+            except Exception:
+                pass
 
         self.plots.set_log(
             f"Preview updated: {processed.output_label} | fs={processed.fs_actual:.2f}→{processed.fs_used:.2f} Hz "
@@ -556,6 +884,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if not key:
             return
         t0, t1 = self.plots.selector_region()
+        regs = self._manual_regions_by_key.get(key, [])
+        regs.append((min(t0, t1), max(t0, t1)))
+        self._manual_regions_by_key[key] = regs
+        self.artifact_panel.set_regions(regs)
+        self._trigger_preview()
+
+    def _add_manual_region_from_drag(self, t0: float, t1: float) -> None:
+        key = self._current_key()
+        if not key:
+            return
+        if not np.isfinite(t0) or not np.isfinite(t1) or t0 == t1:
+            return
         regs = self._manual_regions_by_key.get(key, [])
         regs.append((min(t0, t1), max(t0, t1)))
         self._manual_regions_by_key[key] = regs
@@ -594,12 +934,28 @@ class MainWindow(QtWidgets.QMainWindow):
         for ch in doric.channels:
             existing[ch] = self._metadata_by_key.get((self._current_path, ch), {})
 
-        dlg = MetadataDialog(channels=doric.channels, existing=existing, parent=self)
+        defaults: Dict[str, str] = {}
+        try:
+            raw = self.settings.value("last_metadata_template", "", type=str)
+            if raw:
+                defaults = json.loads(raw)
+        except Exception:
+            defaults = {}
+
+        dlg = MetadataDialog(channels=doric.channels, existing=existing, defaults=defaults, parent=self)
         if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
         meta = dlg.get_metadata()
         for ch, md in meta.items():
             self._metadata_by_key[(self._current_path, ch)] = md
+        try:
+            if self._current_channel and self._current_channel in meta:
+                self.settings.setValue("last_metadata_template", json.dumps(meta[self._current_channel]))
+            elif meta:
+                first = next(iter(meta.values()))
+                self.settings.setValue("last_metadata_template", json.dumps(first))
+        except Exception:
+            pass
 
     # ---------------- Export (multi-file) ----------------
 
@@ -644,7 +1000,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     stem = f"{stem}_{suffix}"
                 csv_path = os.path.join(out_dir, f"{stem}.csv")
                 h5_path = os.path.join(out_dir, f"{stem}.h5")
-                export_processed_csv(csv_path, proc)
+                export_processed_csv(csv_path, proc, metadata=meta)
                 export_processed_h5(h5_path, proc, metadata=meta)
                 n_total += 1
 
@@ -709,6 +1065,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     trial = self._apply_time_window(trial)
                     manual = self._manual_regions_by_key.get(key, [])
                     proc = self.processor.process_trial(trial, params, manual_regions_sec=manual, preview_mode=False)
+                    cutouts = self._cutout_regions_by_key.get(key, [])
+                    proc = self._apply_cutouts_to_processed(proc, cutouts)
                     self._last_processed[key] = proc
                     out.append(proc)
                 except Exception:

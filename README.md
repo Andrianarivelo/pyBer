@@ -67,6 +67,7 @@ The GUI exposes seven explicit output definitions:
 - Export processed output to:
   - CSV (`time`, `output`, optional `dio`)
   - HDF5 with raw, baseline, and metadata fields
+- Drag-and-drop support for preprocessing and post-processing files.
 
 ---
 
@@ -126,3 +127,79 @@ For “fitted ref” modes, choose the fit method (OLS/Lasso/RLM-HuberT).
 ### Export
 
 Export CSV/H5 for analysis in Python/MATLAB/R.
+
+---
+
+## Preprocessing: Advanced Options
+
+The preprocessing panel includes an **Advanced options** button with two features:
+
+1) **Cut out regions (NaN)**  
+Define start/end ranges to exclude parts of the trace from downstream analysis. Cutout regions are filled with NaN in the output and can be exported as-is.
+
+2) **Sections (per-section processing)**  
+Define multiple start/end sections and **assign per-section processing parameters**. Each section can be exported independently (one CSV/H5 per section).
+
+### Time window
+You can optionally set a start time, end time, or both:
+- Start only: process from start → end of recording
+- End only: process from 0 → end
+- Start + end: process that window only
+- Empty: process full trace
+
+---
+
+## Post-Processing
+
+### Align sources
+- **DIO**: choose DIO channel, polarity (0→1 or 1→0), and align to onset/offset
+- **Behavior (CSV/XLSX)**: load a behavior file and select a column (binary 0/1)
+  - Align to onset or offset
+  - **Transitions**: align to A→B transitions with a max gap threshold
+
+### Behavior file formats
+- **CSV**: must include a time column and one or more binary behavior columns
+- **Ethovision XLSX**: the loader uses `ethovision_process_gui.py` cleaning logic; select the sheet when loading
+
+### PSTH/Heatmap
+- Heatmap and PSTH refresh automatically when alignment settings change
+- Event lines are overlaid on the trace preview
+- Event duration histogram appears to the right of the heatmap
+- Metrics bar plot (pre vs post) appears to the right of the PSTH
+
+### Metrics
+Choose AUC or mean z-score and define pre/post windows in seconds.
+
+### Export results
+Export any combination of:
+- Heatmap matrix
+- Average PSTH + SEM
+- Event times
+- Event durations
+- Metrics table
+
+---
+
+## Group Mode (Multiple Animals)
+
+Use the **Group** tab in Post-Processing to load multiple processed files (CSV/H5). Each file should represent a single animal, and matching behavior files should share the same base name. In group mode:
+- Heatmap rows represent animals (not trials)
+- PSTH is averaged across animals
+
+---
+
+## Build (PyInstaller)
+
+Example command (run from repo root):
+
+```bash
+pyinstaller --onefile --windowed --name pyBer main.py
+```
+
+PowerShell helper:
+
+```powershell
+.\build_pyinstaller.ps1
+```
+
+This will create a `pyBer.exe` in the `dist/` folder.
