@@ -1,7 +1,7 @@
 # gui_preprocessing.py
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 import json
 import os
 
@@ -293,8 +293,8 @@ class ArtifactPanel(QtWidgets.QDialog):
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
 
-        self.table = QtWidgets.QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Start (s)", "End (s)"])
+        self.table = QtWidgets.QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["ID", "Start (s)", "End (s)"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
@@ -352,11 +352,15 @@ class ArtifactPanel(QtWidgets.QDialog):
 
     def _rebuild_table(self) -> None:
         self.table.setRowCount(0)
-        for (a, b) in self._regions:
+        for idx, (a, b) in enumerate(self._regions, start=1):
             r = self.table.rowCount()
             self.table.insertRow(r)
-            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(f"{a:.3f}"))
-            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{b:.3f}"))
+            id_item = QtWidgets.QTableWidgetItem(str(idx))
+            id_item.setFlags(id_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            id_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(r, 0, id_item)
+            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{a:.3f}"))
+            self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(f"{b:.3f}"))
 
     def _emit(self) -> None:
         self.regionsChanged.emit(self.regions())
@@ -685,31 +689,35 @@ class AdvancedOptionsDialog(QtWidgets.QDialog):
         cutouts: List[Tuple[float, float]],
         sections: List[Dict[str, object]],
         base_params: ProcessingParams,
+        request_box_select: Optional[Callable[[Callable[[float, float], None]], None]] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Advanced Options")
-        self.setModal(True)
+        self.setModal(False)
         self.resize(720, 520)
         self._base_params = base_params
+        self._request_box_select = request_box_select
 
         layout = QtWidgets.QVBoxLayout(self)
 
         # Cutouts
         grp_cut = QtWidgets.QGroupBox("Cut out regions (set to NaN, excluded from output)")
         vcut = QtWidgets.QVBoxLayout(grp_cut)
-        self.table_cut = QtWidgets.QTableWidget(0, 2)
-        self.table_cut.setHorizontalHeaderLabels(["Start (s)", "End (s)"])
+        self.table_cut = QtWidgets.QTableWidget(0, 3)
+        self.table_cut.setHorizontalHeaderLabels(["ID", "Start (s)", "End (s)"])
         self.table_cut.horizontalHeader().setStretchLastSection(True)
         self.table_cut.verticalHeader().setVisible(False)
         self.table_cut.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table_cut.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table_cut.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
 
         cut_btns = QtWidgets.QHBoxLayout()
         self.btn_cut_add = QtWidgets.QPushButton("Add cut")
         self.btn_cut_del = QtWidgets.QPushButton("Delete cut")
+        self.btn_cut_box = QtWidgets.QPushButton("Box select")
         cut_btns.addWidget(self.btn_cut_add)
         cut_btns.addWidget(self.btn_cut_del)
+        cut_btns.addWidget(self.btn_cut_box)
         cut_btns.addStretch(1)
 
         vcut.addWidget(self.table_cut)
@@ -718,20 +726,22 @@ class AdvancedOptionsDialog(QtWidgets.QDialog):
         # Sections
         grp_sec = QtWidgets.QGroupBox("Sections (processed separately)")
         vsec = QtWidgets.QVBoxLayout(grp_sec)
-        self.table_sec = QtWidgets.QTableWidget(0, 3)
-        self.table_sec.setHorizontalHeaderLabels(["Start (s)", "End (s)", "Params"])
+        self.table_sec = QtWidgets.QTableWidget(0, 4)
+        self.table_sec.setHorizontalHeaderLabels(["ID", "Start (s)", "End (s)", "Params"])
         self.table_sec.horizontalHeader().setStretchLastSection(True)
         self.table_sec.verticalHeader().setVisible(False)
         self.table_sec.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table_sec.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table_sec.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
 
         sec_btns = QtWidgets.QHBoxLayout()
         self.btn_sec_add = QtWidgets.QPushButton("Add section")
         self.btn_sec_del = QtWidgets.QPushButton("Delete section")
         self.btn_sec_params = QtWidgets.QPushButton("Edit params")
+        self.btn_sec_box = QtWidgets.QPushButton("Box select")
         sec_btns.addWidget(self.btn_sec_add)
         sec_btns.addWidget(self.btn_sec_del)
         sec_btns.addWidget(self.btn_sec_params)
+        sec_btns.addWidget(self.btn_sec_box)
         sec_btns.addStretch(1)
 
         vsec.addWidget(self.table_sec)
@@ -756,6 +766,12 @@ class AdvancedOptionsDialog(QtWidgets.QDialog):
         self.btn_sec_params.clicked.connect(self._edit_section_params)
         btn_ok.clicked.connect(self.accept)
         btn_cancel.clicked.connect(self.reject)
+        self.btn_cut_box.clicked.connect(self._box_select_cut)
+        self.btn_sec_box.clicked.connect(self._box_select_section)
+
+        if not self._request_box_select:
+            self.btn_cut_box.setEnabled(False)
+            self.btn_sec_box.setEnabled(False)
 
         self._load_cutouts(cutouts)
         self._load_sections(sections)
@@ -765,8 +781,9 @@ class AdvancedOptionsDialog(QtWidgets.QDialog):
         for (a, b) in cutouts or []:
             r = self.table_cut.rowCount()
             self.table_cut.insertRow(r)
-            self.table_cut.setItem(r, 0, QtWidgets.QTableWidgetItem(f"{float(a):.3f}"))
-            self.table_cut.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{float(b):.3f}"))
+            self.table_cut.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{float(a):.3f}"))
+            self.table_cut.setItem(r, 2, QtWidgets.QTableWidgetItem(f"{float(b):.3f}"))
+        self._refresh_cut_ids()
 
     def _load_sections(self, sections: List[Dict[str, object]]) -> None:
         self.table_sec.setRowCount(0)
@@ -777,43 +794,115 @@ class AdvancedOptionsDialog(QtWidgets.QDialog):
             end = float(sec.get("end", 0.0))
             params = sec.get("params")
             self._set_section_row(r, start, end, params)
+        self._refresh_section_ids()
+
+    def _set_id_item(self, table: QtWidgets.QTableWidget, row: int, idx: int) -> None:
+        item = QtWidgets.QTableWidgetItem(str(idx))
+        item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+        item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        table.setItem(row, 0, item)
+
+    def _refresh_cut_ids(self) -> None:
+        for r in range(self.table_cut.rowCount()):
+            self._set_id_item(self.table_cut, r, r + 1)
+
+    def _refresh_section_ids(self) -> None:
+        for r in range(self.table_sec.rowCount()):
+            self._set_id_item(self.table_sec, r, r + 1)
+
+    @staticmethod
+    def _selected_single_row(table: QtWidgets.QTableWidget) -> Optional[int]:
+        rows = table.selectionModel().selectedRows()
+        if len(rows) == 1:
+            return rows[0].row()
+        return None
+
+    def _box_select_cut(self) -> None:
+        if not self._request_box_select:
+            return
+        self._request_box_select(self._apply_box_to_cut)
+
+    def _box_select_section(self) -> None:
+        if not self._request_box_select:
+            return
+        self._request_box_select(self._apply_box_to_section)
+
+    def _apply_box_to_cut(self, t0: float, t1: float) -> None:
+        if not np.isfinite(t0) or not np.isfinite(t1) or t0 == t1:
+            return
+        a, b = (float(min(t0, t1)), float(max(t0, t1)))
+        row = self._selected_single_row(self.table_cut)
+        if row is None:
+            row = self.table_cut.rowCount()
+            self.table_cut.insertRow(row)
+        self.table_cut.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{a:.3f}"))
+        self.table_cut.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{b:.3f}"))
+        self._refresh_cut_ids()
+        self.table_cut.setCurrentCell(row, 1)
+
+    def _apply_box_to_section(self, t0: float, t1: float) -> None:
+        if not np.isfinite(t0) or not np.isfinite(t1) or t0 == t1:
+            return
+        a, b = (float(min(t0, t1)), float(max(t0, t1)))
+        row = self._selected_single_row(self.table_sec)
+        params_dict: Optional[Dict[str, object]] = None
+        if row is not None:
+            item = self.table_sec.item(row, 3)
+            if item:
+                data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(data, dict):
+                    params_dict = data
+        if row is None:
+            row = self.table_sec.rowCount()
+            self.table_sec.insertRow(row)
+            params_dict = self._base_params.to_dict()
+        self._set_section_row(row, a, b, params_dict)
+        self._refresh_section_ids()
+        self.table_sec.setCurrentCell(row, 1)
 
     def _set_section_row(self, row: int, start: float, end: float, params: Optional[Dict[str, object]]) -> None:
-        self.table_sec.setItem(row, 0, QtWidgets.QTableWidgetItem(f"{float(start):.3f}"))
-        self.table_sec.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{float(end):.3f}"))
+        self._set_id_item(self.table_sec, row, row + 1)
+        self.table_sec.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{float(start):.3f}"))
+        self.table_sec.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{float(end):.3f}"))
         p = ProcessingParams.from_dict(params) if isinstance(params, dict) else self._base_params
         summary = f"{p.output_mode} | {p.baseline_method}"
         item = QtWidgets.QTableWidgetItem(summary)
         item.setData(QtCore.Qt.ItemDataRole.UserRole, p.to_dict())
-        self.table_sec.setItem(row, 2, item)
+        self.table_sec.setItem(row, 3, item)
 
     def _add_cut(self) -> None:
         r = self.table_cut.rowCount()
         self.table_cut.insertRow(r)
-        self.table_cut.setItem(r, 0, QtWidgets.QTableWidgetItem(""))
         self.table_cut.setItem(r, 1, QtWidgets.QTableWidgetItem(""))
+        self.table_cut.setItem(r, 2, QtWidgets.QTableWidgetItem(""))
+        self._refresh_cut_ids()
 
     def _del_cut(self) -> None:
         rows = self.table_cut.selectionModel().selectedRows()
+        for row in sorted((r.row() for r in rows), reverse=True):
+            self.table_cut.removeRow(row)
         if rows:
-            self.table_cut.removeRow(rows[0].row())
+            self._refresh_cut_ids()
 
     def _add_section(self) -> None:
         r = self.table_sec.rowCount()
         self.table_sec.insertRow(r)
         self._set_section_row(r, 0.0, 0.0, self._base_params.to_dict())
+        self._refresh_section_ids()
 
     def _del_section(self) -> None:
         rows = self.table_sec.selectionModel().selectedRows()
+        for row in sorted((r.row() for r in rows), reverse=True):
+            self.table_sec.removeRow(row)
         if rows:
-            self.table_sec.removeRow(rows[0].row())
+            self._refresh_section_ids()
 
     def _edit_section_params(self) -> None:
         rows = self.table_sec.selectionModel().selectedRows()
         if not rows:
             return
         r = rows[0].row()
-        item = self.table_sec.item(r, 2)
+        item = self.table_sec.item(r, 3)
         params_dict = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
         params = ProcessingParams.from_dict(params_dict) if isinstance(params_dict, dict) else self._base_params
         dlg = SectionParamsDialog(params, self)
@@ -822,10 +911,11 @@ class AdvancedOptionsDialog(QtWidgets.QDialog):
         new_params = dlg.get_params()
         self._set_section_row(
             r,
-            float(self._read_float(self.table_sec.item(r, 0))),
             float(self._read_float(self.table_sec.item(r, 1))),
+            float(self._read_float(self.table_sec.item(r, 2))),
             new_params.to_dict(),
         )
+        self._refresh_section_ids()
 
     @staticmethod
     def _read_float(item: Optional[QtWidgets.QTableWidgetItem]) -> float:
@@ -839,8 +929,8 @@ class AdvancedOptionsDialog(QtWidgets.QDialog):
     def get_cutouts(self) -> List[Tuple[float, float]]:
         out: List[Tuple[float, float]] = []
         for r in range(self.table_cut.rowCount()):
-            a = self._read_float(self.table_cut.item(r, 0))
-            b = self._read_float(self.table_cut.item(r, 1))
+            a = self._read_float(self.table_cut.item(r, 1))
+            b = self._read_float(self.table_cut.item(r, 2))
             if b <= a:
                 continue
             out.append((a, b))
@@ -849,11 +939,11 @@ class AdvancedOptionsDialog(QtWidgets.QDialog):
     def get_sections(self) -> List[Dict[str, object]]:
         out: List[Dict[str, object]] = []
         for r in range(self.table_sec.rowCount()):
-            a = self._read_float(self.table_sec.item(r, 0))
-            b = self._read_float(self.table_sec.item(r, 1))
+            a = self._read_float(self.table_sec.item(r, 1))
+            b = self._read_float(self.table_sec.item(r, 2))
             if b <= a:
                 continue
-            item = self.table_sec.item(r, 2)
+            item = self.table_sec.item(r, 3)
             params_dict = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
             out.append({"start": a, "end": b, "params": params_dict})
         return out
@@ -1274,6 +1364,7 @@ class ParameterPanel(QtWidgets.QGroupBox):
 
     def get_params(self) -> ProcessingParams:
         return ProcessingParams(
+            artifact_detection_enabled=self.cb_artifact.isChecked(),
             artifact_mode=self.combo_artifact.currentText(),
             mad_k=float(self.spin_mad.value()),
             adaptive_window_s=float(self.spin_adapt_win.value()),
@@ -1295,6 +1386,7 @@ class ParameterPanel(QtWidgets.QGroupBox):
     def set_params(self, params: ProcessingParams) -> None:
         if not params:
             return
+        self.cb_artifact.setChecked(bool(getattr(params, "artifact_detection_enabled", True)))
         self.combo_artifact.setCurrentText(str(params.artifact_mode))
         self.spin_mad.setValue(float(params.mad_k))
         self.spin_adapt_win.setValue(float(params.adaptive_window_s))
@@ -1391,6 +1483,7 @@ class PlotDashboard(QtWidgets.QWidget):
     manualRegionFromDragRequested = QtCore.Signal(float, float)
     clearManualRegionsRequested = QtCore.Signal()
     showArtifactsRequested = QtCore.Signal()
+    boxSelectionCleared = QtCore.Signal()
 
     xRangeChanged = QtCore.Signal(float, float)
 
@@ -1539,6 +1632,7 @@ class PlotDashboard(QtWidgets.QWidget):
 
     def _on_drag_select_cleared(self) -> None:
         self.selector.setVisible(False)
+        self.boxSelectionCleared.emit()
 
     def _toggle_box_select(self, enabled: bool) -> None:
         self._raw_vb.set_drag_enabled(enabled)

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
@@ -208,6 +208,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sections_by_key: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
 
         self._last_processed: Dict[Tuple[str, str], ProcessedTrial] = {}
+        self._advanced_dialog: Optional[AdvancedOptionsDialog] = None
+        self._box_select_callback: Optional[Callable[[float, float], None]] = None
 
         # Worker infra (stable)
         self._pool = QtCore.QThreadPool.globalInstance()
@@ -311,6 +313,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plots.manualRegionFromDragRequested.connect(self._add_manual_region_from_drag)
         self.plots.clearManualRegionsRequested.connect(self._clear_manual_regions_current)
         self.plots.showArtifactsRequested.connect(self._toggle_artifacts_panel)
+        self.plots.boxSelectionCleared.connect(self._cancel_box_select_request)
 
         self.artifact_panel.regionsChanged.connect(self._artifact_regions_changed)
 
@@ -487,16 +490,40 @@ class MainWindow(QtWidgets.QMainWindow):
         key = self._current_key()
         if not key:
             return
+        if self._advanced_dialog and self._advanced_dialog.isVisible():
+            self._advanced_dialog.raise_()
+            self._advanced_dialog.activateWindow()
+            return
         cutouts = self._cutout_regions_by_key.get(key, [])
         sections = self._sections_by_key.get(key, [])
-        dlg = AdvancedOptionsDialog(cutouts, sections, self.param_panel.get_params(), self)
-        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
-        self._cutout_regions_by_key[key] = dlg.get_cutouts()
-        self._sections_by_key[key] = dlg.get_sections()
-        self._last_processed.clear()
-        self._update_raw_plot()
-        self._trigger_preview()
+        dlg = AdvancedOptionsDialog(
+            cutouts,
+            sections,
+            self.param_panel.get_params(),
+            request_box_select=self._request_box_select,
+            parent=self,
+        )
+        self._advanced_dialog = dlg
+
+        def _cleanup() -> None:
+            if self._advanced_dialog is dlg:
+                self._advanced_dialog = None
+            self._cancel_box_select_request()
+
+        def _apply() -> None:
+            if self._advanced_dialog is not dlg:
+                return
+            self._cutout_regions_by_key[key] = dlg.get_cutouts()
+            self._sections_by_key[key] = dlg.get_sections()
+            self._last_processed.clear()
+            self._update_raw_plot()
+            self._trigger_preview()
+            _cleanup()
+
+        dlg.accepted.connect(_apply)
+        dlg.rejected.connect(_cleanup)
+        dlg.finished.connect(_cleanup)
+        dlg.show()
 
     def _run_qc_dialog(self) -> None:
         if not self._current_path or not self._current_channel:
@@ -891,6 +918,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._trigger_preview()
 
     def _add_manual_region_from_drag(self, t0: float, t1: float) -> None:
+        if self._box_select_callback:
+            cb = self._box_select_callback
+            self._box_select_callback = None
+            self.plots.btn_box_select.setChecked(False)
+            cb(float(min(t0, t1)), float(max(t0, t1)))
+            return
         key = self._current_key()
         if not key:
             return
@@ -909,6 +942,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._manual_regions_by_key[key] = []
         self.artifact_panel.set_regions([])
         self._trigger_preview()
+
+    def _request_box_select(self, callback: Callable[[float, float], None]) -> None:
+        self._box_select_callback = callback
+        self.plots.btn_box_select.setChecked(True)
+        self.plots.set_log("Box select: drag on the raw plot to set the time window; right-click to cancel.")
+
+    def _cancel_box_select_request(self) -> None:
+        if not self._box_select_callback:
+            return
+        self._box_select_callback = None
+        self.plots.btn_box_select.setChecked(False)
 
     def _artifact_regions_changed(self, regions: List[Tuple[float, float]]) -> None:
         key = self._current_key()

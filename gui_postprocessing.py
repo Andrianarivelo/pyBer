@@ -32,6 +32,46 @@ def _compact_combo(combo: QtWidgets.QComboBox, min_chars: int = 6) -> None:
     combo.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
 
 
+class FileDropList(QtWidgets.QListWidget):
+    filesDropped = QtCore.Signal(list)
+    orderChanged = QtCore.Signal()
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragEnabled(True)
+        self.setDropIndicatorShown(True)
+        self.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
+        self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.DragDrop)
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        if event.mimeData().hasUrls():
+            paths = []
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                    if path:
+                        paths.append(path)
+            if paths:
+                self.filesDropped.emit(paths)
+                event.acceptProposedAction()
+                return
+        super().dropEvent(event)
+        self.orderChanged.emit()
+
+
 def _extract_rising_edges(time: np.ndarray, dio: np.ndarray, threshold: float = 0.5) -> np.ndarray:
     t = np.asarray(time, float)
     x = np.asarray(dio, float)
@@ -271,8 +311,15 @@ class PostProcessingPanel(QtWidgets.QWidget):
         self.btn_use_current = QtWidgets.QPushButton("Use current preprocessed selection")
         self.btn_use_current.setProperty("class", "compactPrimary")
         self.btn_use_current.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.btn_load_processed_single = QtWidgets.QPushButton("Load processed file (CSV/H5)")
+        self.btn_load_processed_single.setProperty("class", "compactSmall")
+        self.btn_load_processed_single.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         single_layout.addWidget(self.lbl_current)
         single_layout.addWidget(self.btn_use_current)
+        single_layout.addWidget(self.btn_load_processed_single)
         single_layout.addStretch(1)
 
         group_layout = QtWidgets.QVBoxLayout(tab_group)
@@ -299,6 +346,7 @@ class PostProcessingPanel(QtWidgets.QWidget):
 
         self.combo_align = QtWidgets.QComboBox()
         self.combo_align.addItems(["DIO (from Doric)", "Behavior (CSV/XLSX)"])
+        self.combo_align.setCurrentIndex(1)
         _compact_combo(self.combo_align, min_chars=6)
 
         self.combo_dio = QtWidgets.QComboBox()
@@ -317,12 +365,12 @@ class PostProcessingPanel(QtWidgets.QWidget):
         self.lbl_beh.setProperty("class", "hint")
 
         # Preprocessed files list
-        self.list_preprocessed = QtWidgets.QListWidget()
+        self.list_preprocessed = FileDropList()
         self.list_preprocessed.setMaximumHeight(120)
         self.list_preprocessed.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
 
         # Behaviors list
-        self.list_behaviors = QtWidgets.QListWidget()
+        self.list_behaviors = FileDropList()
         self.list_behaviors.setMaximumHeight(120)
         self.list_behaviors.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
 
@@ -700,6 +748,11 @@ class PostProcessingPanel(QtWidgets.QWidget):
         self.btn_refresh_dio.clicked.connect(self.requestDioList.emit)
         self.btn_load_beh.clicked.connect(self._load_behavior_files)
         self.btn_load_processed.clicked.connect(self._load_processed_files)
+        self.btn_load_processed_single.clicked.connect(self._load_processed_files_single)
+        self.list_preprocessed.filesDropped.connect(self._on_preprocessed_files_dropped)
+        self.list_preprocessed.orderChanged.connect(self._sync_processed_order_from_list)
+        self.list_behaviors.filesDropped.connect(self._on_behavior_files_dropped)
+        self.list_behaviors.orderChanged.connect(self._sync_behavior_order_from_list)
         self.btn_compute.clicked.connect(self._compute_psth)
         self.btn_update.clicked.connect(self._compute_psth)
         self.btn_export.clicked.connect(self._export_results)
@@ -808,6 +861,76 @@ class PostProcessingPanel(QtWidgets.QWidget):
             return
         self._dio_cache[(path, dio_name)] = (np.asarray(t, float), np.asarray(x, float))
 
+    def _load_behavior_paths(self, paths: List[str], replace: bool) -> None:
+        if replace:
+            self._behavior_sources.clear()
+        for p in paths:
+            stem = os.path.splitext(os.path.basename(p))[0]
+            ext = os.path.splitext(p)[1].lower()
+            try:
+                if ext == ".csv":
+                    info = _load_behavior_csv(p)
+                elif ext == ".xlsx":
+                    import pandas as pd
+                    xls = pd.ExcelFile(p, engine="openpyxl")
+                    sheet = None
+                    if len(xls.sheet_names) > 1:
+                        sheet, ok = QtWidgets.QInputDialog.getItem(
+                            self,
+                            "Select sheet",
+                            f"{os.path.basename(p)}: choose sheet",
+                            xls.sheet_names,
+                            0,
+                            False,
+                        )
+                        if not ok:
+                            continue
+                    info = _load_behavior_ethovision(p, sheet_name=sheet)
+                else:
+                    continue
+                self._behavior_sources[stem] = info
+            except Exception:
+                continue
+        self.lbl_beh.setText(f"{len(self._behavior_sources)} file(s) loaded")
+
+    def _load_processed_paths(self, paths: List[str], replace: bool) -> None:
+        loaded: List[ProcessedTrial] = []
+        for p in paths:
+            ext = os.path.splitext(p)[1].lower()
+            if ext == ".csv":
+                trial = self._load_processed_csv(p)
+            elif ext in (".h5", ".hdf5"):
+                trial = self._load_processed_h5(p)
+            else:
+                trial = None
+            if trial is not None:
+                loaded.append(trial)
+        if not loaded:
+            return
+        if replace:
+            self._processed = loaded
+        else:
+            self._processed.extend(loaded)
+        self.lbl_group.setText(f"{len(self._processed)} file(s) loaded")
+        self._update_file_lists()
+        self._set_resample_from_processed()
+        self._compute_psth()
+
+    def _on_preprocessed_files_dropped(self, paths: List[str]) -> None:
+        allowed = {".csv", ".h5", ".hdf5"}
+        keep = [p for p in paths if os.path.splitext(p)[1].lower() in allowed]
+        if not keep:
+            return
+        self._load_processed_paths(keep, replace=False)
+
+    def _on_behavior_files_dropped(self, paths: List[str]) -> None:
+        allowed = {".csv", ".xlsx"}
+        keep = [p for p in paths if os.path.splitext(p)[1].lower() in allowed]
+        if not keep:
+            return
+        self._load_behavior_paths(keep, replace=False)
+        self._refresh_behavior_list()
+
     # ---- behavior files ----
 
     def _update_align_ui(self) -> None:
@@ -912,39 +1035,11 @@ class PostProcessingPanel(QtWidgets.QWidget):
         )
         if not paths:
             return
-        self._behavior_sources.clear()
-        for p in paths:
-            stem = os.path.splitext(os.path.basename(p))[0]
-            ext = os.path.splitext(p)[1].lower()
-            try:
-                if ext == ".csv":
-                    info = _load_behavior_csv(p)
-                elif ext == ".xlsx":
-                    import pandas as pd
-                    xls = pd.ExcelFile(p, engine="openpyxl")
-                    sheet = None
-                    if len(xls.sheet_names) > 1:
-                        sheet, ok = QtWidgets.QInputDialog.getItem(
-                            self,
-                            "Select sheet",
-                            f"{os.path.basename(p)}: choose sheet",
-                            xls.sheet_names,
-                            0,
-                            False,
-                        )
-                        if not ok:
-                            continue
-                    info = _load_behavior_ethovision(p, sheet_name=sheet)
-                else:
-                    continue
-                self._behavior_sources[stem] = info
-            except Exception:
-                continue
+        self._load_behavior_paths(paths, replace=True)
         try:
             self._settings.setValue("postprocess_last_dir", os.path.dirname(paths[0]))
         except Exception:
             pass
-        self.lbl_beh.setText(f"{len(paths)} file(s) loaded")
         self._refresh_behavior_list()
 
     def _load_processed_files(self) -> None:
@@ -957,27 +1052,19 @@ class PostProcessingPanel(QtWidgets.QWidget):
         )
         if not paths:
             return
-        loaded: List[ProcessedTrial] = []
-        for p in paths:
-            ext = os.path.splitext(p)[1].lower()
-            if ext == ".csv":
-                trial = self._load_processed_csv(p)
-            elif ext in (".h5", ".hdf5"):
-                trial = self._load_processed_h5(p)
-            else:
-                trial = None
-            if trial is not None:
-                loaded.append(trial)
-        if loaded:
-            self._processed = loaded
-            self.lbl_group.setText(f"{len(loaded)} file(s) loaded")
-            self._refresh_behavior_list()
-            self._set_resample_from_processed()
-            self._compute_psth()
+        self._load_processed_paths(paths, replace=True)
         try:
             self._settings.setValue("postprocess_last_dir", os.path.dirname(paths[0]))
         except Exception:
             pass
+
+    def _load_processed_files_single(self) -> None:
+        self._load_processed_files()
+        if not self._processed:
+            return
+        proc = self._processed[0]
+        filename = os.path.basename(proc.path) if proc.path else "import"
+        self.set_current_source_label(filename, proc.channel_id or "import")
 
     def _load_processed_csv(self, path: str) -> Optional[ProcessedTrial]:
         import csv
@@ -1107,13 +1194,41 @@ class PostProcessingPanel(QtWidgets.QWidget):
             filename = os.path.splitext(os.path.basename(proc.path))[0]
             # Remove _AIN01/_AIN02 suffix for matching
             filename_clean = filename.replace('_AIN01', '').replace('_AIN02', '')
-            self.list_preprocessed.addItem(f"{i}. {filename_clean}")
+            item = QtWidgets.QListWidgetItem(f"{i}. {filename_clean}")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, id(proc))
+            self.list_preprocessed.addItem(item)
 
         self.list_behaviors.clear()
         for i, (stem, _) in enumerate(self._behavior_sources.items(), 1):
             # Remove _AIN01/_AIN02 suffix for matching
             stem_clean = stem.replace('_AIN01', '').replace('_AIN02', '')
-            self.list_behaviors.addItem(f"{i}. {stem_clean}")
+            item = QtWidgets.QListWidgetItem(f"{i}. {stem_clean}")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, stem)
+            self.list_behaviors.addItem(item)
+
+    def _sync_processed_order_from_list(self) -> None:
+        new_order: List[ProcessedTrial] = []
+        id_map = {id(proc): proc for proc in self._processed}
+        for i in range(self.list_preprocessed.count()):
+            item = self.list_preprocessed.item(i)
+            proc_id = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
+            proc = id_map.get(proc_id)
+            if proc is not None:
+                new_order.append(proc)
+        if new_order and len(new_order) == len(self._processed):
+            self._processed = new_order
+            self._update_file_lists()
+
+    def _sync_behavior_order_from_list(self) -> None:
+        keys: List[str] = []
+        for i in range(self.list_behaviors.count()):
+            item = self.list_behaviors.item(i)
+            key = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
+            if isinstance(key, str) and key in self._behavior_sources:
+                keys.append(key)
+        if keys and len(keys) == len(self._behavior_sources):
+            self._behavior_sources = {k: self._behavior_sources[k] for k in keys}
+            self._update_file_lists()
 
     def _move_selected_up(self) -> None:
         """Move selected items up in the list."""
@@ -1123,27 +1238,11 @@ class PostProcessingPanel(QtWidgets.QWidget):
 
         if selected_preproc:
             self._move_items_up(self.list_preprocessed, selected_preproc)
-            # Reorder the processed list accordingly
-            indices = [self.list_preprocessed.row(item) for item in selected_preproc]
-            if indices and min(indices) > 0:
-                for idx in sorted(set(indices)):
-                    self._processed[idx], self._processed[idx-1] = self._processed[idx-1], self._processed[idx]
-                self._update_file_lists()
+            self._sync_processed_order_from_list()
 
         if selected_behav:
             self._move_items_up(self.list_behaviors, selected_behav)
-            # Reorder the behavior sources accordingly
-            selected_stems = [item.text().split('. ', 1)[1] for item in selected_behav]
-            if selected_stems:
-                # Rebuild behavior_sources in new order
-                new_order = list(self._behavior_sources.keys())
-                for stem in selected_stems:
-                    if stem in new_order:
-                        idx = new_order.index(stem)
-                        if idx > 0:
-                            new_order[idx], new_order[idx-1] = new_order[idx-1], new_order[idx]
-                self._behavior_sources = {k: self._behavior_sources[k] for k in new_order}
-                self._update_file_lists()
+            self._sync_behavior_order_from_list()
 
     def _move_selected_down(self) -> None:
         """Move selected items down in the list."""
@@ -1153,29 +1252,11 @@ class PostProcessingPanel(QtWidgets.QWidget):
 
         if selected_preproc:
             self._move_items_down(self.list_preprocessed, selected_preproc)
-            # Reorder the processed list accordingly
-            indices = [self.list_preprocessed.row(item) for item in selected_preproc]
-            max_idx = len(self._processed) - 1
-            if indices and max(indices) < max_idx:
-                for idx in sorted(set(indices), reverse=True):
-                    self._processed[idx], self._processed[idx+1] = self._processed[idx+1], self._processed[idx]
-                self._update_file_lists()
+            self._sync_processed_order_from_list()
 
         if selected_behav:
             self._move_items_down(self.list_behaviors, selected_behav)
-            # Reorder the behavior sources accordingly
-            selected_stems = [item.text().split('. ', 1)[1] for item in selected_behav]
-            if selected_stems:
-                # Rebuild behavior_sources in new order
-                new_order = list(self._behavior_sources.keys())
-                for stem in selected_stems:
-                    if stem in new_order:
-                        idx = new_order.index(stem)
-                        max_idx = len(new_order) - 1
-                        if idx < max_idx:
-                            new_order[idx], new_order[idx+1] = new_order[idx+1], new_order[idx]
-                self._behavior_sources = {k: self._behavior_sources[k] for k in new_order}
-                self._update_file_lists()
+            self._sync_behavior_order_from_list()
 
     def _move_items_up(self, list_widget: QtWidgets.QListWidget, selected_items: List[QtWidgets.QListWidgetItem]) -> None:
         """Move selected items up in a QListWidget."""
@@ -1548,8 +1629,8 @@ class PostProcessingPanel(QtWidgets.QWidget):
             self.img.setImage(np.zeros((1, 1)))
             return
 
-        # pyqtgraph ImageItem expects (col,row) or (row,col). We'll provide (rows, cols)
-        img = np.asarray(mat, float)
+        # ImageItem maps axis-0 -> x and axis-1 -> y; transpose so time is x, trials are y.
+        img = np.asarray(mat, float).T
         cmap_name = str(self._style.get("heatmap_cmap", "viridis"))
         try:
             cmap = pg.colormap.get(cmap_name)
@@ -1569,8 +1650,9 @@ class PostProcessingPanel(QtWidgets.QWidget):
         x1 = float(tvec[-1]) if tvec.size else 1.0
         if x1 == x0:
             x1 = x0 + 1.0
-        self.img.setRect(QtCore.QRectF(x0, 0, x1 - x0, img.shape[0]))
+        self.img.setRect(QtCore.QRectF(x0, 0, x1 - x0, img.shape[1]))
         self.plot_heat.setXRange(x0, x1, padding=0)
+        self.plot_heat.setYRange(0, float(img.shape[1]), padding=0)
 
     def _render_duration_hist(self, durations: np.ndarray) -> None:
         self.plot_dur.clear()

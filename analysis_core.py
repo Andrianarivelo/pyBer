@@ -66,6 +66,7 @@ class ProcessingParams:
     # -------------------------
     # Artifact detection
     # -------------------------
+    artifact_detection_enabled: bool = True
     artifact_mode: str = "Global MAD (dx)"  # or "Adaptive MAD (windowed)"
     mad_k: float = 8.0
     adaptive_window_s: float = 5.0
@@ -859,14 +860,17 @@ class PhotometryProcessor:
         # ---------------------------------------------------------------------
         # 3) Artifact detection on raw 465, then apply manual regions
         # ---------------------------------------------------------------------
-        if str(params.artifact_mode).startswith("Adaptive"):
-            mask = detect_artifacts_adaptive(
-                t, sig, float(params.mad_k), float(params.adaptive_window_s), float(params.artifact_pad_s)
-            )
+        if bool(getattr(params, "artifact_detection_enabled", True)):
+            if str(params.artifact_mode).startswith("Adaptive"):
+                mask = detect_artifacts_adaptive(
+                    t, sig, float(params.mad_k), float(params.adaptive_window_s), float(params.artifact_pad_s)
+                )
+            else:
+                mask = detect_artifacts_global_dx(
+                    t, sig, float(params.mad_k), float(params.artifact_pad_s)
+                )
         else:
-            mask = detect_artifacts_global_dx(
-                t, sig, float(params.mad_k), float(params.artifact_pad_s)
-            )
+            mask = np.zeros_like(t, dtype=bool)
 
         mask = apply_manual_regions(t, mask, manual_regions_sec or [])
 
