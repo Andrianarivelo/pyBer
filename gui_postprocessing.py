@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import json
 from pathlib import Path
 from dataclasses import dataclass
@@ -2074,6 +2075,9 @@ class PostProcessingPanel(QtWidgets.QWidget):
         prefix = "postprocess"
         if self._processed:
             prefix = os.path.splitext(os.path.basename(self._processed[0].path))[0]
+        beh_suffix = self._behavior_suffix()
+        if beh_suffix:
+            prefix = f"{prefix}_{beh_suffix}"
 
         if choices.get("heatmap"):
             np.savetxt(os.path.join(out_dir, f"{prefix}_heatmap.csv"), self._last_mat, delimiter=",")
@@ -2107,6 +2111,22 @@ class PostProcessingPanel(QtWidgets.QWidget):
                         self._last_global_metrics.get("thr", ""),
                         self._last_global_metrics.get("duration", ""),
                     ])
+
+    def _behavior_suffix(self) -> str:
+        if not self.combo_align.currentText().startswith("Behavior"):
+            return ""
+        align_mode = self.combo_behavior_align.currentText()
+        if align_mode.startswith("Transition"):
+            a = self.combo_behavior_from.currentText().strip()
+            b = self.combo_behavior_to.currentText().strip()
+            name = f"{a}_to_{b}" if a and b else ""
+        else:
+            name = self.combo_behavior_name.currentText().strip()
+        if not name:
+            return ""
+        cleaned = re.sub(r"\s+", "_", name)
+        cleaned = re.sub(r"[^A-Za-z0-9_\-]+", "", cleaned)
+        return cleaned
 
     def _export_images(self) -> None:
         start_dir = self._settings.value("postprocess_last_dir", os.getcwd(), type=str)

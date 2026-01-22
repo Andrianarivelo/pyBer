@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QGroupBox,
     QFormLayout,
+    QPlainTextEdit,
 )
 
 import pyqtgraph as pg
@@ -50,6 +51,76 @@ def find_header_row(excel_path: Path, sheet_name: str) -> int:
         if row.apply(lambda x: bool(target.match(x))).any():
             return i
     raise ValueError(f"Could not find header row (cell 'Trial time') in sheet '{sheet_name}'.")
+
+
+def extract_metadata(excel_path: Path, sheet_name: str) -> Dict[str, str]:
+    """
+    Extract metadata from rows before the data header.
+
+    EthoVision exports typically have a variable number of metadata rows above the
+    actual data header. This function reads those rows and tries to parse key/value
+    pairs. It is intentionally tolerant (skips blank/nan rows).
+
+    Returns:
+        Dict[str, str]: metadata entries.
+    """
+    try:
+        header_row = find_header_row(excel_path, sheet_name)
+    except ValueError:
+        return {}
+
+    if header_row <= 0:
+        return {}
+
+    preview = pd.read_excel(
+        excel_path,
+        sheet_name=sheet_name,
+        header=None,
+        engine="openpyxl",
+        nrows=header_row,
+    )
+
+    metadata: Dict[str, str] = {}
+
+    for i in range(preview.shape[0]):
+        row = preview.iloc[i, :]
+        # find first non-empty cell as key
+        key = None
+        key_col = None
+        for col_idx in range(preview.shape[1]):
+            v = row.iloc[col_idx]
+            if pd.isna(v):
+                continue
+            s = str(v).strip()
+            if not s or s.lower() in {"nan", "none"}:
+                continue
+            key = s
+            key_col = col_idx
+            break
+
+        if key is None or key_col is None:
+            continue
+
+        # find the next non-empty cell after key as value
+        value = None
+        for col_idx in range(key_col + 1, preview.shape[1]):
+            v = row.iloc[col_idx]
+            if pd.isna(v):
+                continue
+            s = str(v).strip()
+            if not s or s.lower() in {"nan", "none"}:
+                continue
+            value = s
+            break
+
+        if value is None:
+            continue
+
+        # avoid overwriting if duplicate keys appear; keep first occurrence
+        if key not in metadata:
+            metadata[key] = value
+
+    return metadata
 
 
 def coerce_decimal_comma_to_float(s: pd.Series) -> pd.Series:
@@ -157,6 +228,7 @@ class WorkbookData:
     path: Path
     sheets: List[str]
     cleaned: Dict[str, pd.DataFrame]
+    metadata: Dict[str, Dict[str, str]]
 
 
 class PlotPanel(QWidget):
@@ -278,11 +350,22 @@ class MainWindow(QMainWindow):
         self.y_list.setSelectionMode(QListWidget.NoSelection)
         self.y_list.itemChanged.connect(self.update_plot)
 
+        # Metadata display
+        self.meta_text = QPlainTextEdit()
+        self.meta_text.setReadOnly(True)
+        self.meta_text.setPlaceholderText("Metadata (header rows above 'Trial time') will appear here")
+
         export_selected_btn = QPushButton("Export selected columns to CSV…")
         export_selected_btn.clicked.connect(self.export_selected_columns_csv)
 
         export_sheet_btn = QPushButton("Export full cleaned sheet to CSV…")
         export_sheet_btn.clicked.connect(self.export_full_sheet_csv)
+
+        export_meta_btn = QPushButton("Export metadata (current sheet)…")
+        export_meta_btn.clicked.connect(self.export_metadata)
+
+        export_sheet_with_meta_btn = QPushButton("Export cleaned sheet + metadata…")
+        export_sheet_with_meta_btn.clicked.connect(self.export_full_sheet_with_metadata)
 
         left_box = QGroupBox("Controls")
         form = QFormLayout()
@@ -291,8 +374,12 @@ class MainWindow(QMainWindow):
         form.addRow("X axis:", self.x_combo)
         form.addRow(QLabel("Y columns (check to plot):"))
         form.addRow(self.y_list)
+        form.addRow(QLabel("Metadata:"))
+        form.addRow(self.meta_text)
         form.addRow(export_selected_btn)
         form.addRow(export_sheet_btn)
+        form.addRow(export_meta_btn)
+        form.addRow(export_sheet_with_meta_btn)
         left_box.setLayout(form)
 
         left_widget = QWidget()
@@ -322,6 +409,10 @@ class MainWindow(QMainWindow):
         act_open = QAction("Open…", self)
         act_open.triggered.connect(self.open_file)
         file_menu.addAction(act_open)
+
+        act_export_meta = QAction("Export metadata (current sheet)…", self)
+        act_export_meta.triggered.connect(self.export_metadata)
+        file_menu.addAction(act_export_meta)
 
         act_quit = QAction("Quit", self)
         act_quit.triggered.connect(self.close)
@@ -361,16 +452,22 @@ class MainWindow(QMainWindow):
             sheets = list(xls.sheet_names)
 
             cleaned: Dict[str, pd.DataFrame] = {}
+            metadata: Dict[str, Dict[str, str]] = {}
             interp = self.interpolate_cb.isChecked()
 
             for sh in sheets:
+                try:
+                    metadata[sh] = extract_metadata(path, sh)
+                except Exception:
+                    metadata[sh] = {}
+
                 try:
                     cleaned[sh] = clean_sheet(path, sh, interpolate=interp)
                 except Exception as e:
                     cleaned[sh] = pd.DataFrame()
                     QMessageBox.warning(self, "Sheet parse warning", f"Failed to clean '{sh}':\n{e}")
 
-            self.workbook = WorkbookData(path=path, sheets=sheets, cleaned=cleaned)
+            self.workbook = WorkbookData(path=path, sheets=sheets, cleaned=cleaned, metadata=metadata)
             self.file_label.setText(str(path))
             self.status_label.setText(f"Loaded {len(sheets)} sheet(s).")
 
@@ -412,6 +509,14 @@ class MainWindow(QMainWindow):
             return
 
         df = self.workbook.cleaned[sheet_name]
+
+        # Metadata display
+        md = self.workbook.metadata.get(sheet_name, {}) if self.workbook else {}
+        if not md:
+            self.meta_text.setPlainText("(No metadata found above the header in this sheet)")
+        else:
+            lines = [f"{k}: {v}" for k, v in sorted(md.items(), key=lambda kv: kv[0].lower())]
+            self.meta_text.setPlainText("\n".join(lines))
 
         # X combo
         self.x_combo.blockSignals(True)
@@ -501,6 +606,71 @@ class MainWindow(QMainWindow):
             return
 
         df.loc[:, cols].to_csv(out_path, index=False)
+        QMessageBox.information(self, "Exported", f"Saved:\n{out_path}")
+
+    def export_metadata(self):
+        if not self.workbook:
+            return
+        sh = self.sheet_combo.currentText()
+        md = self.workbook.metadata.get(sh, {})
+        if not md:
+            QMessageBox.information(self, "Nothing to export", "No metadata found for the current sheet.")
+            return
+
+        default_base = re.sub(r"[^\w\-]+", "_", sh).strip("_") or "sheet"
+        # Offer json or csv via extension
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save metadata",
+            default_base + ".metadata.json",
+            "JSON (*.json);;CSV (*.csv)",
+        )
+        if not out_path:
+            return
+
+        out_p = Path(out_path)
+        suffix = out_p.suffix.lower()
+        if suffix == ".csv":
+            pd.DataFrame({"key": list(md.keys()), "value": list(md.values())}).to_csv(out_path, index=False)
+        else:
+            # write JSON without importing json (pandas handles nicely)
+            pd.Series(md).to_json(out_path, indent=2)
+
+        QMessageBox.information(self, "Exported", f"Saved:\n{out_path}")
+
+    def export_full_sheet_with_metadata(self):
+        """Export cleaned data plus metadata in a single CSV file.
+
+        We prepend metadata as commented lines starting with '# ' so the file stays readable.
+        It's also easy to parse later.
+        """
+        if not self.workbook:
+            return
+        sh = self.sheet_combo.currentText()
+        df = self.workbook.cleaned.get(sh, pd.DataFrame())
+        if df.empty:
+            QMessageBox.information(self, "Nothing to export", "The current sheet has no cleaned data.")
+            return
+
+        md = self.workbook.metadata.get(sh, {})
+
+        default_name = re.sub(r"[^\w\-]+", "_", sh).strip("_") + ".clean_with_meta.csv"
+        out_path, _ = QFileDialog.getSaveFileName(self, "Save cleaned sheet + metadata CSV", default_name, "CSV (*.csv)")
+        if not out_path:
+            return
+
+        # Write with a small header block + then the CSV table.
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(f"# source_file: {self.workbook.path}\n")
+            f.write(f"# sheet: {sh}\n")
+            if md:
+                for k, v in sorted(md.items(), key=lambda kv: kv[0].lower()):
+                    f.write(f"# {k}: {v}\n")
+            else:
+                f.write("# (no metadata found)\n")
+            f.write("\n")
+        df.to_csv(out_path, index=False, mode="a")
+
         QMessageBox.information(self, "Exported", f"Saved:\n{out_path}")
 
 
