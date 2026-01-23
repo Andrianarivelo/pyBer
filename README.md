@@ -193,7 +193,7 @@ Use the **Group** tab in Post-Processing to load multiple processed files (CSV/H
 Example command (run from repo root):
 
 ```bash
-pyinstaller --onefile --windowed --name pyBer main.py
+python -m PyInstaller --noconfirm --clean pyBer.spec
 ```
 
 PowerShell helper:
